@@ -2815,6 +2815,8 @@ class SB:
         labels; pass the full untruncated text so an elided middle still
         matches). `free_input=True` + `on_free` lets Enter on a query with NO
         match commit the raw query (e.g. an abs path → new workspace)."""
+        if self._menu_active:
+            self._close_menu()
         if not options:
             if not (filterable and free_input):
                 return                       # 空列表但允许 free_input → 仍打开（可输路径新建）
@@ -2840,7 +2842,13 @@ class SB:
         self._menu_on_cancel = on_cancel
         self._menu_multi = bool(multi_select)
         self._menu_checked = set(pre_checked) if pre_checked else set()
-        self._menu_apply_filter()            # 设 _menu_options + _menu_map（初始 query 为空 → 全量）
+        try:
+            self._menu_apply_filter()        # 设 _menu_options + _menu_map（初始 query 为空 → 全量）
+        except Exception:
+            # Defensive fallback: malformed menu data must not block typing.
+            self._close_menu()
+            self._render_live()
+            return
         self._render_live()
 
     def _menu_apply_filter(self) -> None:
@@ -2882,6 +2890,40 @@ class SB:
         self._menu_all_labels = []
         self._menu_filter_keys = []
         self._menu_map = []
+
+    def _menu_state_ok(self) -> bool:
+        """Return whether current menu state can safely stay modal."""
+        if not self._menu_active:
+            return True
+
+        has_handler = (
+            self._menu_on_submit is not None
+            or self._menu_on_cancel is not None
+            or (self._menu_free and self._menu_on_free is not None)
+        )
+        if not has_handler:
+            return False
+
+        if self._menu_filterable:
+            if len(self._menu_filter_keys) != len(self._menu_all_labels):
+                return False
+            # In filterable mode the visible rows map must stay 1:1 with map
+            # entries, and each mapping must point at a valid all_labels slot.
+            if len(self._menu_options) != len(self._menu_map):
+                return False
+            if any(i < 0 or i >= len(self._menu_all_labels) for i in self._menu_map):
+                return False
+            # sel == -1 means focus is on the search input row.
+            if self._menu_sel < -1 or self._menu_sel >= len(self._menu_options):
+                return False
+            return True
+
+        # Single / multi-select non-filterable menus keep all labels == options.
+        if len(self._menu_all_labels) != len(self._menu_options):
+            return False
+        if self._menu_sel < 0 or self._menu_sel >= len(self._menu_options):
+            return False
+        return True
 
     @staticmethod
     def _scroll_window(sel: int, total: int, visible: int, scroll: int) -> int:
@@ -5531,6 +5573,9 @@ class SB:
         except UnicodeDecodeError as e:
             text = self._tail[:e.start].decode('utf-8', 'ignore'); self._tail = self._tail[e.start:]
         for ch in text:
+            if self._menu_active and not self._menu_state_ok():
+                self._close_menu()
+                self._render_live()
             o = ord(ch)
             # ── menu picker key intercept (modal: blocks all input editing) ─
             # /llm, /continue, … open an arrow-key menu.  ↑↓ move highlight
