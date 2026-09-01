@@ -44,8 +44,8 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = []
-packages = ["ga_cli"]
+py-modules = ["agentmain", "agent_loop", "ga", "ga_config", "ga_execution", "ga_runtime", "ga_session", "llmcore", "simphtml", "TMWebDriver"]
+packages = ["ga_cli", "ga_harness", "plugins"]
 
 [project.scripts]
 ga = "ga_cli.cli:main"

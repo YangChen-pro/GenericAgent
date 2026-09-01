@@ -147,6 +147,11 @@ def cmd_update():
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "run":
+        from ga_harness.runner import main as run_main
+
+        raise SystemExit(run_main(sys.argv[2:]))
+
     parser = argparse.ArgumentParser(
         prog="ga",
         description="GenericAgent 全局命令入口",
@@ -160,6 +165,7 @@ def main():
               ga tui2              启动终端 TUI (v2 增强版)
               ga pet               启动桌面宠物 v2
               ga launch            启动 webview 桌面壳
+              ga run --help         运行独立 benchmark harness
               ga list              列出所有命令
         """),
     )

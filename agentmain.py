@@ -1,216 +1,24 @@
-import os, sys, threading, queue, time, json, re, random, locale, glob
-os.environ.setdefault('GA_LANG', 'zh' if any(k in (locale.getlocale()[0] or '').lower() for k in ('zh', 'chinese')) else 'en')
-if sys.stdout is None: sys.stdout = open(os.devnull, "w")
-elif hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(errors='replace')
-if sys.stderr is None: sys.stderr = open(os.devnull, "w")
-elif hasattr(sys.stderr, 'reconfigure'): sys.stderr.reconfigure(errors='replace')
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+"""Legacy GenericAgent entrypoint."""
 
-from llmcore import reload_mykeys, ToolClient, MixinSession, NativeToolClient, NativeClaudeSession, NativeOAISession, resolve_client
-from agent_loop import agent_runner_loop
-try:
-    from plugins.hooks import discover_and_load; discover_and_load()
-except Exception: pass
-from ga import GenericAgentHandler, smart_format, get_global_memory, format_error, consume_file
+import glob
+import json
+import os
+import sys
+import threading
+import time
 
-script_dir = os.path.dirname(os.path.abspath(__file__))
-BANNED_TOOLS = (['ask_user', 'start_long_term_update'] if '--no-user-tools' in sys.argv else [])
-def load_tool_schema(suffix=''):
+from ga import consume_file
+from ga_config import load_tool_schema as _load_tool_schema, script_dir
+from ga_runtime import GeneraticAgent, GenericAgent
+
+TOOLS_SCHEMA = _load_tool_schema()
+
+def load_tool_schema(suffix=""):
+    """Compatibility wrapper used by existing frontends."""
     global TOOLS_SCHEMA
-    TS = open(os.path.join(script_dir, f'assets/tools_schema{suffix}.json'), 'r', encoding='utf-8').read()
-    TOOLS_SCHEMA = json.loads(TS if os.name == 'nt' else TS.replace('powershell', 'bash'))
-    TOOLS_SCHEMA = [t for t in TOOLS_SCHEMA if t.get('function', {}).get('name') not in BANNED_TOOLS]
-load_tool_schema()
+    TOOLS_SCHEMA = _load_tool_schema(suffix)
+    return TOOLS_SCHEMA
 
-lang_suffix = '_en' if os.environ.get('GA_LANG', '') == 'en' else ''
-mem_dir = os.path.join(script_dir, 'memory')
-if not os.path.exists(mem_dir): os.makedirs(mem_dir)
-mem_txt = os.path.join(mem_dir, 'global_mem.txt')
-if not os.path.exists(mem_txt): open(mem_txt, 'w', encoding='utf-8').write('# [Global Memory - L2]\n')
-mem_insight = os.path.join(mem_dir, 'global_mem_insight.txt')
-if not os.path.exists(mem_insight):
-    t = os.path.join(script_dir, f'assets/global_mem_insight_template{lang_suffix}.txt')
-    open(mem_insight, 'w', encoding='utf-8').write(open(t, encoding='utf-8').read() if os.path.exists(t) else '')
-
-def get_system_prompt():
-    with open(os.path.join(script_dir, f'assets/sys_prompt{lang_suffix}.txt'), 'r', encoding='utf-8') as f: prompt = f.read()
-    prompt += f"\nToday: {time.strftime('%Y-%m-%d %a')}\n"
-    prompt += get_global_memory()
-    return prompt
-
-# SDK:
-# agent = GenericAgent(); threading.Thread(target=agent.run, daemon=True).start()
-# output1_queue = agent.put_task(prompt1)
-# output2_queue = agent.put_task(prompt2)
-class GenericAgent:
-    def __init__(self):
-        os.makedirs(os.path.join(script_dir, 'temp'), exist_ok=True)
-        self.lock = threading.Lock()
-        self.task_dir = None
-        self.history = []; self.handler = None; self.all_outputs = []
-        self.task_queue = queue.Queue() 
-        self.is_running = False; self.stop_sig = False; self.llm_no = 0;
-        # Output queue of the task currently executing (None when idle). Lets a UI that
-        # lost its own handle (page refresh, second client) re-attach to the live task.
-        self._current_queue = None  
-        self.inc_out = False; self.verbose = True
-        self.peer_hint = True
-        self.force_non_stream = False
-        logid = f'{(time.time_ns() + random.randrange(1_000_000)) % 1_000_000:06d}'
-        self.log_path = os.path.join(script_dir, f'temp/model_responses/model_responses_{logid}.txt')
-        self.llmclient = None
-        self.load_llm_sessions()
-        self.extra_sys_prompts = []
-        self.intervene = self.extrakeyinfo = None
-
-    def load_llm_sessions(self):
-        mykeys, changed = reload_mykeys()
-        if not changed and hasattr(self, 'llmclients'): return
-        try: oldhistory, oldname = self.llmclient.backend.history, self.llmclient.backend.name
-        except: oldhistory = oldname = None
-        llm_sessions = []
-        for k, cfg in mykeys.items():
-            if not any(x in k for x in ['api', 'config', 'cookie']): continue
-            try:
-                if 'mixin' in k: llm_sessions += [{'mixin_cfg': cfg}]
-                elif c := resolve_client(k): llm_sessions += [c]
-            except: pass
-        for i, s in enumerate(llm_sessions):
-            if isinstance(s, dict) and 'mixin_cfg' in s:
-                try:
-                    mixin = MixinSession(llm_sessions, s['mixin_cfg'])
-                    if isinstance(mixin._sessions[0], (NativeClaudeSession, NativeOAISession)): llm_sessions[i] = NativeToolClient(mixin)
-                    else: llm_sessions[i] = ToolClient(mixin)
-                except Exception as e: print(f'\n\n\n[ERROR] Failed to init MixinSession with cfg {s["mixin_cfg"]}: {e}!!!\n\n')
-        self.llmclients = llm_sessions
-        if not self.llmclients: return
-        names = [c.backend.name if not isinstance(c, dict) else f'BADMIXIN_{i}' for i, c in enumerate(self.llmclients)]
-        if oldname in names: self.llm_no = names.index(oldname)
-        self.llmclient = self.llmclients[self.llm_no%len(self.llmclients)]
-        if oldhistory: self.llmclient.backend.history = oldhistory
-    
-    def next_llm(self, n=-1):
-        self.load_llm_sessions()
-        if not self.llmclients: return
-        self.llm_no = ((self.llm_no + 1) if n < 0 else n) % len(self.llmclients)
-        lastc = self.llmclient
-        self.llmclient = self.llmclients[self.llm_no]
-        try: self.llmclient.backend.history = lastc.backend.history
-        except: raise Exception('[ERROR] BAD Mixin config: Check your mykey.py')
-        self.llmclient.last_tools = ''
-        load_tool_schema()
-    def list_llms(self): 
-        self.load_llm_sessions()
-        return [(i, self.get_llm_name(b), i == self.llm_no) for i, b in enumerate(self.llmclients)]
-    def get_llm_name(self, b=None, model=False):
-        b = self.llmclient if b is None else b
-        if isinstance(b, dict): return 'BADCONFIG_MIXIN'
-        if model: return b.backend.model.lower()
-        return f"{type(b.backend).__name__.replace('Session', '')}/{b.backend.name}"
-    def get_ctx_multiplier(self): return getattr(self.llmclient.backend, 'maxlen_multiplier', 1.0)
-
-    def abort(self):
-        if not self.is_running: return
-        print('Abort current task...')
-        self.stop_sig = True
-        if self.handler is not None: self.handler.code_stop_signal.append(1)
-        for sess in getattr(self.llmclient.backend, '_sessions', [self.llmclient.backend]):
-            sess.should_stop = lambda: self.stop_sig  # live read; cleared by run()'s finally
-            try:  # wake a recv() blocked in another thread. Verified on Windows: shutdown()/close() do NOT
-                  # wake it (makefile refcount defers real closesocket); _real_close() does -> ChunkedEncodingError
-                import socket as _socket
-                raw = sess.active_response.raw
-                fp = getattr(getattr(raw, '_fp', None), 'fp', None)  # http.client response -> buffered socket file
-                sock = fp.raw._sock if fp else raw.connection.sock   # SocketIO._sock (SSL-wrapped OK); fallback urllib3 conn
-                try: sock.shutdown(_socket.SHUT_RDWR)  # for non-Windows semantics
-                except OSError: pass
-                try: sock._real_close()  # CPython internal; bypasses refcount -> actual closesocket
-                except AttributeError: sock.close()
-            except Exception: pass
-            try: sess.active_response.close()
-            except Exception: pass
-            
-    def put_task(self, query, source="user", images=None):
-        display_queue = queue.Queue()
-        self.task_queue.put({"query": query, "source": source, "images": images or [], "output": display_queue})
-        return display_queue
-
-    # i know it is dangerous, but raw_query is dangerous enough it doesn't enlarge
-    def _handle_slash_cmd(self, raw_query, display_queue):
-        if not raw_query.startswith('/'): return raw_query
-        if _sm := re.match(r'/session\.(\w+)=(.*)', raw_query.strip()):
-            k, v = _sm.group(1), _sm.group(2)
-            vfile = os.path.join(script_dir, 'temp', v)
-            if os.path.isfile(vfile): v = open(vfile, encoding='utf-8').read().strip()
-            try: v = json.loads(v)  # cover number parsing
-            except (json.JSONDecodeError, ValueError): pass
-            setattr(self.llmclient.backend, k, v)
-            display_queue.put({'done': smart_format(f"✅ session.{k} = {repr(v)}", max_str_len=500), 'source': 'system'})
-            return None
-        if raw_query.strip() == '/resume':
-            return r'帮我看看最近有哪些会话可以恢复。读model_responses/目录，按修改时间取最近10个文件，从每个文件里找最后一个<history>...</history>块，用一句话总结每个会话在聊什么，列表给我选。注意读文件后要把字面的\n替换成真换行才能正确匹配。'
-        return raw_query
-
-    def run(self):
-        while True:
-            task = self.task_queue.get()
-            if isinstance(task, str): break
-            raw_query, source, display_queue = task["query"], task["source"], task["output"]
-            raw_query = self._handle_slash_cmd(raw_query, display_queue)
-            if raw_query is None:
-                self.task_queue.task_done(); continue
-            self.is_running = True; self._current_queue = display_queue
-            if len(raw_query) > 2000:
-                task_file = os.path.join(script_dir, 'temp', f'user_prompt_{os.getpid()}_{time.time_ns()}.md')
-                with open(task_file, 'w', encoding='utf-8') as f: f.write(raw_query)
-                raw_query = f'Long user prompt saved to {task_file}. Read and execute.'
-            self.all_outputs.append({"input": raw_query, "outputs": []})
-            if len(self.all_outputs) > 10000: self.all_outputs = self.all_outputs[-5000:]
-            rquery = smart_format(raw_query.replace('\n', ' '), max_str_len=200)
-            self.history.append(f"[USER]: {rquery}")
-            sys_prompt = get_system_prompt() + '\n'.join(self.extra_sys_prompts) + getattr(self.llmclient.backend, 'extra_sys_prompt', '')
-            if self.peer_hint: sys_prompt += f"\n[Peer] 用户提及其他会话/后台任务状态时: temp/model_responses/ (只找近期修改的文件尾部)\n"
-            handler = GenericAgentHandler(self, self.history, os.path.join(script_dir, 'temp'))
-            if getattr(self, 'no_print', False): handler.print = lambda *a, **k: None
-            if self.handler and 'key_info' in self.handler.working: 
-                ki = re.sub(r'\n\[SYSTEM\] 此为.*?工作记忆[。\n]*', '', self.handler.working['key_info'])  # 去旧
-                handler.working['key_info'] = ki
-                handler.working['passed_sessions'] = ps = self.handler.working.get('passed_sessions', 0) + 1
-                if ps > 0: handler.working['key_info'] += f'\n[SYSTEM] 此为 {ps} 个对话前设置的key_info，若已在新任务，先更新或清除工作记忆。\n'
-            self.handler = handler  # although new handler, the **full** history is in llmclient, so it is full history!
-            self.llmclient.log_path = self.log_path
-            if self.force_non_stream:
-                self.llmclient.backend.stream = False
-                self.llmclient.backend.read_timeout = max(self.llmclient.backend.read_timeout, 1200)
-            gen = agent_runner_loop(self.llmclient, sys_prompt, raw_query, handler, TOOLS_SCHEMA, 
-                                    max_turns=180, verbose=self.verbose, yield_info=True)
-            try:
-                full_resp = ""; last_pos = 0; curr_turn = 0; turn_resps = self.all_outputs[-1]["outputs"]
-                for chunk in gen:
-                    if consume_file(self.task_dir, '_stop'): self.abort() 
-                    if self.stop_sig: break
-                    if isinstance(chunk, dict) and 'turn' in chunk: 
-                        curr_turn = chunk['turn']; turn_resps.append(''); continue
-                    full_resp += chunk;  turn_resps[-1] += chunk
-                    if len(full_resp) - last_pos > 30 or 'LLM Running' in chunk:
-                        display_queue.put({'next': full_resp[last_pos:] if self.inc_out else full_resp, 
-                                           'source': source, 'turn': curr_turn, 'outputs': turn_resps[-2:]})
-                        last_pos = len(full_resp)
-                if self.inc_out and last_pos < len(full_resp):
-                    display_queue.put({'next': full_resp[last_pos:], 'source': source,
-                                    'turn': curr_turn, 'outputs': turn_resps[-2:]})
-                display_queue.put({'done': full_resp, 'source': source, 'turn': curr_turn, 'outputs': turn_resps.copy()})
-                self.history = handler.history_info
-            except Exception as e:
-                print(f"Backend Error: {format_error(e)}")
-                display_queue.put({'done': full_resp + f'\n```\n{format_error(e)}\n```', 'source': source, 'turn': curr_turn, 'outputs': turn_resps.copy()})
-            finally:
-                if self.stop_sig: print('User aborted the task.')
-                self.is_running = self.stop_sig = False  # keep _current_queue: its final 'done' may still be unclaimed (refreshed UI salvages it); next task overwrites it
-                self.task_queue.task_done()
-                if self.handler is not None: self.handler.code_stop_signal.append(1)
-
-GeneraticAgent = GenericAgent
 
 if __name__ == '__main__':
     import argparse
@@ -226,6 +34,7 @@ if __name__ == '__main__':
     parser.add_argument('--nobg', action='store_true')
     parser.add_argument('--nolog', action='store_true')
     parser.add_argument('--no-user-tools', action='store_true')
+    parser.add_argument('--no-memory-write', action='store_true')
     args, _unknown = parser.parse_known_args()
     _extra_args = dict(zip([k.lstrip('-') for k in _unknown[::2]], _unknown[1::2])) if _unknown else {}
 

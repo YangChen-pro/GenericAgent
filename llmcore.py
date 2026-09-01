@@ -148,7 +148,7 @@ def _raise_if_retryable_overload(emsg):
     if emsg and re.search(r'concurrency|retry later|overloaded|rate.?limit', emsg, re.I):
         raise requests.ConnectionError(emsg)
 
-def _parse_claude_sse(resp_lines):
+def _parse_claude_sse(resp_lines, observer=None):
     """Parse Anthropic SSE stream. Yields text chunks, returns list[content_block]."""
     content_blocks = []; current_block = None; tool_json_buf = ""
     stop_reason = None; got_message_stop = False; warn = None
@@ -178,11 +178,15 @@ def _parse_claude_sse(resp_lines):
             if delta.get("type") == "text_delta":
                 text = delta.get("text", "")
                 if current_block and current_block.get("type") == "text": current_block["text"] += text
-                if text: yield text
+                if text:
+                    if observer: observer("content", text)
+                    yield text
             elif delta.get("type") == "thinking_delta":
                 thinking = delta.get("thinking", "")
                 if current_block and current_block.get("type") == "thinking": current_block["thinking"] += thinking
-                if thinking: yield thinking
+                if thinking:
+                    if observer: observer("reasoning", thinking)
+                    yield thinking
             elif delta.get("type") == "signature_delta":
                 if current_block and current_block.get("type") == "thinking":
                     current_block["signature"] = current_block.get("signature", "") + delta.get("signature", "")
@@ -236,7 +240,7 @@ def _try_parse_tool_args(raw):
         return parsed
     return [{"_raw": raw}]
 
-def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
+def _parse_openai_sse(resp_lines, api_mode="chat_completions", observer=None):
     """Parse OpenAI SSE stream (chat_completions or responses API).
     Yields text chunks, returns list[content_block].
     content_block: {type:'text', text:str} | {type:'tool_use', id:str, name:str, input:dict}
@@ -255,13 +259,21 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
             etype = evt.get("type", "")
             if etype == "response.output_text.delta":
                 delta = evt.get("delta", "")
-                if delta: seen_delta = True; content_text += delta; yield delta
+                if delta:
+                    seen_delta = True; content_text += delta
+                    if observer: observer("content", delta)
+                    yield delta
             elif etype == "response.output_text.done" and not seen_delta:
                 text = evt.get("text", "")
-                if text: content_text += text; yield text
+                if text:
+                    content_text += text
+                    if observer: observer("content", text)
+                    yield text
             elif etype == "response.reasoning_text.delta":
                 delta = evt.get("delta", "")
-                if delta: reasoning_text += delta
+                if delta:
+                    reasoning_text += delta
+                    if observer: observer("reasoning", delta)
             elif etype == "response.reasoning_text.done":
                 text = evt.get("text", "")
                 if text: reasoning_text = text
@@ -330,9 +342,13 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
             ch = (evt.get("choices") or [{}])[0]
             delta = ch.get("delta") or {}
             if rc := delta.get("reasoning_content") or delta.get("reasoning", ""):
-                reasoning_text += rc; yield rc
+                reasoning_text += rc
+                if observer: observer("reasoning", rc)
+                yield rc
             if delta.get("content"):
-                text = delta["content"]; content_text += text; yield text
+                text = delta["content"]; content_text += text
+                if observer: observer("content", text)
+                yield text
             for tc in (delta.get("tool_calls") or []):
                 idx = tc.get("index", 0)
                 has_name = bool(tc.get("function", {}).get("name"))
@@ -454,7 +470,7 @@ def _stream_with_retry(sess, url, headers, payload, parse_fn):
             time.sleep(0.2)
         return _stopped()
     for attempt in range(sess.max_retries + 1):
-        if _stopped(): return []
+        if _stopped(): return sess.partial_stream_blocks()
         streamed = False
         STATS.update(t_start=time.time(), t_ttft=None)
         if not sess.stream: STATS['t_ttft'] = STATS['t_start']
@@ -477,7 +493,7 @@ def _stream_with_retry(sess, url, headers, payload, parse_fn):
                 try:
                     while True:
                         if getattr(sess, 'should_stop', None) and sess.should_stop():
-                            STATS['t_end'] = time.time(); return []
+                            STATS['t_end'] = time.time(); return sess.partial_stream_blocks()
                         chunk = next(gen)
                         if chunk and STATS.get('t_ttft') is None: STATS['t_ttft'] = time.time()
                         streamed = True; yield chunk
@@ -488,7 +504,7 @@ def _stream_with_retry(sess, url, headers, payload, parse_fn):
                     return e.value or []
         except (requests.Timeout, requests.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
             err = f"!!!Error: {type(e).__name__}: {e}" if str(e) else f"!!!Error: {type(e).__name__}"
-            if getattr(sess, 'should_stop', None) and sess.should_stop(): return []
+            if getattr(sess, 'should_stop', None) and sess.should_stop(): return sess.partial_stream_blocks()
             if attempt < sess.max_retries:
                 d = _delay(None, attempt)
                 print(f"[LLM Retry] {type(e).__name__}, retry in {d:.1f}s ({attempt+1}/{sess.max_retries+1})")
@@ -496,10 +512,13 @@ def _stream_with_retry(sess, url, headers, payload, parse_fn):
                 continue
             yield err; return [{"type": "text", "text": err}]
         except Exception as e:
+            if _stopped():
+                return sess.partial_stream_blocks()
             err = f"\n\n[!!! 流异常中断 {type(e).__name__}: {e} !!!]" if streamed else f"!!!Error: {type(e).__name__}: {e}"
             yield err; return [{"type": "text", "text": err}]
 
 def _openai_stream(sess, messages):
+    sess.reset_stream_capture()
     model, api_mode = sess.model, sess.api_mode
     ml = model.lower()
     temperature = sess.temperature
@@ -524,10 +543,12 @@ def _openai_stream(sess, messages):
         if temperature != 1: payload["temperature"] = temperature
         if sess.max_tokens: payload["max_completion_tokens" if ml.startswith(("gpt-5", "o1", "o2", "o3", "o4")) else "max_tokens"] = sess.max_tokens
         if sess.reasoning_effort: payload["reasoning_effort"] = sess.reasoning_effort
+        if sess.chat_template_kwargs:
+            payload["chat_template_kwargs"] = dict(sess.chat_template_kwargs)
     tools = getattr(sess, 'tools', None)
     if tools: payload["tools"] = _prepare_oai_tools(tools, api_mode)
     if sess.service_tier: payload["service_tier"] = sess.service_tier
-    parse_fn = (lambda r: _parse_openai_sse(r.iter_lines(), api_mode)) if sess.stream else (lambda r: _parse_openai_json(r.json(), api_mode))
+    parse_fn = (lambda r: _parse_openai_sse(r.iter_lines(), api_mode, sess.capture_stream)) if sess.stream else (lambda r: _parse_openai_json(r.json(), api_mode))
     return (yield from _stream_with_retry(sess, url, headers, payload, parse_fn))
         
 def _prepare_oai_tools(tools, api_mode="chat_completions"):
@@ -661,8 +682,27 @@ class BaseSession:
         self.api_mode = 'responses' if mode in ('responses', 'response') else 'chat_completions'
         self.temperature = cfg.get('temperature', 1)
         self.max_tokens = cfg.get('max_tokens')
+        self.chat_template_kwargs = cfg.get('chat_template_kwargs')
         self.default_ua = "claude-cli/2.1.152 (external, cli)"
         self.user_agent = cfg.get("user_agent", self.default_ua)
+        self.stream_observer = None
+        self.should_stop = lambda: False
+        self.active_response = None
+        self._stream_capture = {"reasoning": "", "content": ""}
+    def reset_stream_capture(self):
+        self._stream_capture = {"reasoning": "", "content": ""}
+    def capture_stream(self, kind, text):
+        if kind in self._stream_capture and text:
+            self._stream_capture[kind] += text
+        if self.stream_observer is not None:
+            self.stream_observer(kind, text)
+    def partial_stream_blocks(self):
+        blocks = []
+        if self._stream_capture["reasoning"]:
+            blocks.append({"type": "thinking", "thinking": self._stream_capture["reasoning"]})
+        if self._stream_capture["content"]:
+            blocks.append({"type": "text", "text": self._stream_capture["content"]})
+        return blocks
     def _apply_claude_thinking(self, payload):
         if self.thinking_type:
             thinking = {"type": self.thinking_type}
@@ -714,6 +754,7 @@ def _ensure_thinking_blocks(messages, model):
 
 class ClaudeSession(BaseSession):
     def raw_ask(self, messages):
+        self.reset_stream_capture()
         messages = _fix_messages(messages)
         if self.max_tokens is None: self.max_tokens = 8192
         headers = {"x-api-key": self.api_key, "Content-Type": "application/json", "anthropic-version": "2023-06-01", "anthropic-beta": "prompt-caching-2024-07-31"}
@@ -722,7 +763,7 @@ class ClaudeSession(BaseSession):
         self._apply_claude_thinking(payload)
         if self.system: payload["system"] = [{"type": "text", "text": self.system, "cache_control": {"type": "persistent"}}]
         url = auto_make_url(self.api_base, "messages")
-        parse_fn = (lambda r: _parse_claude_sse(r.iter_lines())) if self.stream else (lambda r: _parse_claude_json(r.json()))
+        parse_fn = (lambda r: _parse_claude_sse(r.iter_lines(), self.capture_stream)) if self.stream else (lambda r: _parse_claude_json(r.json()))
         return (yield from _stream_with_retry(self, url, headers, payload, parse_fn))
     def make_messages(self, raw_list):
         msgs = _drop_unsigned_thinking([{"role": m['role'], "content": list(m['content'])} for m in raw_list])
@@ -784,6 +825,7 @@ class NativeClaudeSession(BaseSession):
         if self.user_agent == self.default_ua: self.user_agent = self.native_ua
         self.api_key_header = str(cfg.get('api_key_header', 'auto')).strip().lower()
     def raw_ask(self, messages):
+        self.reset_stream_capture()
         if self.max_tokens is None: self.max_tokens = 8192
         model = self.model
         messages = _fix_messages(messages)
@@ -824,7 +866,7 @@ class NativeClaudeSession(BaseSession):
             messages[idx] = {**messages[idx], "content": list(messages[idx]["content"])}
             messages[idx]["content"][-1] = dict(messages[idx]["content"][-1], cache_control={"type": "ephemeral"})
         url = auto_make_url(self.api_base, "messages") + '?beta=true'
-        parse_fn = (lambda r: _parse_claude_sse(r.iter_lines())) if self.stream else (lambda r: _parse_claude_json(r.json()))
+        parse_fn = (lambda r: _parse_claude_sse(r.iter_lines(), self.capture_stream)) if self.stream else (lambda r: _parse_claude_json(r.json()))
         return (yield from _stream_with_retry(self, url, headers, payload, parse_fn))
 
     def ask(self, msg):
@@ -1060,7 +1102,8 @@ class MixinSession:
     _TRANSPORT_OVERRIDES = frozenset({
         'stream', 'connect_timeout', 'read_timeout', 'temperature', 'max_tokens',
         'reasoning_effort', 'service_tier', 'thinking_type',
-        'thinking_budget_tokens', 'omit_thinking', 'proxies', 'verify',
+        'thinking_budget_tokens', 'omit_thinking', 'chat_template_kwargs',
+        'stream_observer', 'should_stop', 'proxies', 'verify',
     })
     _FACADE_STATE = frozenset({'name', 'history', 'system', 'tools', 'lock'})
 

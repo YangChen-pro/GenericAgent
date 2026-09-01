@@ -13,7 +13,7 @@ def safe_print(*args, **kwargs):
     try: print(*args, **kwargs)
     except: pass
 
-def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop_signal=None, maxlen=10000, myprint=safe_print):
+def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop_signal=None, maxlen=10000, myprint=safe_print, progress=None):
     """代码执行器
     python: 运行复杂的 .py 脚本（文件模式）
     powershell/bash: 运行单行指令（命令模式）
@@ -52,6 +52,8 @@ def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop
                 except UnicodeDecodeError: line = line_bytes.decode('gbk', errors='ignore')
                 logs.append(line)
                 myprint(line, end="")
+                if progress:
+                    progress(line)
         except: pass
 
     try:
@@ -155,9 +157,9 @@ def format_error(e):
         return f"{exc_type.__name__}: {str(e)} @ {fname}:{f.lineno}, {f.name} -> `{f.line}`"
     return f"{exc_type.__name__}: {str(e)}"
 
-def log_memory_access(path):
+def log_memory_access(path, memory_dir=None):
     if 'memory' not in path: return
-    stats_file = os.path.join(script_dir, 'memory/file_access_stats.json')
+    stats_file = os.path.join(memory_dir or os.path.join(script_dir, 'memory'), 'file_access_stats.json')
     try:
         with open(stats_file, 'r', encoding='utf-8') as f: stats = json.load(f)
     except: stats = {}
@@ -279,10 +281,12 @@ def consume_file(dr, file):
 
 class GenericAgentHandler(BaseHandler):
     '''Generic Agent 工具库，包含多种工具的实现。工具函数自动加上了 do_ 前缀。实际工具名没有前缀。'''
-    def __init__(self, parent, last_history=None, cwd='./temp'):
+    def __init__(self, parent, last_history=None, cwd='./temp', memory_dir=None):
         self.parent = parent
         self.working = {}
-        self.cwd = cwd;  self.current_turn = 0
+        self.cwd = os.path.abspath(cwd)
+        self.memory_dir = os.path.abspath(memory_dir or os.path.join(script_dir, 'memory'))
+        self.current_turn = 0
         self.history_info = last_history if last_history else []
         self.code_stop_signal = []
         self._done_hooks = []
@@ -323,7 +327,13 @@ class GenericAgentHandler(BaseHandler):
                     except SyntaxError: exec(code, ns); result = ns.get('_r', 'OK')
                 except Exception as e: result = f'Error: {e}'
             finally: os.chdir(old_cwd)
-        else: result = yield from code_run(code, code_type, timeout, cwd, code_cwd=code_cwd, stop_signal=self.code_stop_signal, maxlen=maxlen, myprint=self.print)
+        else:
+            progress = getattr(self.parent, "report_tool_progress", None)
+            result = yield from code_run(
+                code, code_type, timeout, cwd, code_cwd=code_cwd,
+                stop_signal=self.code_stop_signal, maxlen=maxlen,
+                myprint=self.print, progress=progress,
+            )
         next_prompt = self._get_anchor_prompt(skip=args.get('_index', 0) > 0)
         return StepOutcome(result, next_prompt=next_prompt)
     
@@ -439,7 +449,7 @@ class GenericAgentHandler(BaseHandler):
         maxlen = self._get_tool_maxlen(15000, args)
         result = smart_format(result, max_str_len=maxlen, omit_str='\n\n[omitted long content]\n\n')
         next_prompt = self._get_anchor_prompt(skip=args.get('_index', 0) > 0)
-        log_memory_access(path)
+        log_memory_access(path, self.memory_dir)
         if 'memory' in path or 'sop' in path: 
             next_prompt += "\n[SYSTEM TIPS] 正在读取记忆或SOP文件，若决定按sop执行请提取sop中的关键点（特别是靠后的）update working memory."
         return StepOutcome(result, next_prompt=next_prompt)
@@ -534,9 +544,9 @@ class GenericAgentHandler(BaseHandler):
 - **复杂任务经验**（关键坑点/前置条件/重要步骤）→ L3 精简 SOP（只记你被坑得多次重试的核心要点）
 **禁止**：临时变量、具体推理过程、未验证信息、通用常识、你可以轻松复现的细节、只是做了但没有验证的信息
 **操作**：严格遵循提供的L0的记忆更新SOP。先 `file_read` 看现有 → 判断类型 → 最小化更新 → 无新内容跳过，保证对记忆库最小局部修改。\n
-''' + get_global_memory()
+''' + get_global_memory(self.memory_dir, self.cwd)
         yield "[Info] Start distilling good memory for long-term storage.\n"
-        path = './memory/memory_management_sop.md'
+        path = os.path.join(self.memory_dir, 'memory_management_sop.md')
         if os.path.exists(path): result = 'This is L0:\n' + file_read(path, show_linenos=False)
         else: result = "Memory Management SOP not found. Do not update memory."
         if self.current_turn < 10: result, prompt = 'start_long_term_update is only used after completing a long turn task!', '\n'
@@ -585,29 +595,37 @@ class GenericAgentHandler(BaseHandler):
             next_prompt += f"\n\n[DANGER] Turn {turn}. Call update_working_checkpoint to save key context. Stop ineffective retries; if no progress, switch strategy: 1) Probe physical boundaries 2) **Re-read relevant SOPs**"
         elif turn % 31 == 0:
             next_prompt += f"\n\n[DANGER] Turn {turn}. Write checkpoints/key findings/tried approaches to a **file** for future reference (not only working_checkpoint!). Avoid losing critical info."
-        elif turn % 10 == 0: next_prompt += get_global_memory()
+        elif turn % 10 == 0: next_prompt += get_global_memory(self.memory_dir, self.cwd)
 
         if _plan and turn >= 10 and turn % 5 == 0:
             next_prompt = f"[Plan Hint] 正在计划模式。必须 file_read({_plan}) 确认当前步骤，回复开头引用：📌 当前步骤：...\n\n" + next_prompt
         if _plan and turn >= 190: next_prompt += f"\n\n[DANGER] Plan模式已运行 {turn} 轮，已达上限。必须 ask_user 汇报进度并确认是否继续。"
 
-        injkeyinfo = self.parent.extrakeyinfo or consume_file(self.parent.task_dir, '_keyinfo')
-        injprompt = self.parent.intervene or consume_file(self.parent.task_dir, '_intervene')
-        if injkeyinfo: self.working['key_info'] = self.working.get('key_info', '') + f"\n[MASTER] {injkeyinfo}"
-        if injprompt: next_prompt += f"\n\n[MASTER] {injprompt}\n"
-        self.parent.intervene = self.parent.extrakeyinfo = None
+        if not getattr(self.parent, "harness_mode", False):
+            injkeyinfo = self.parent.extrakeyinfo or consume_file(self.parent.task_dir, '_keyinfo')
+            injprompt = self.parent.intervene or consume_file(self.parent.task_dir, '_intervene')
+            if injkeyinfo:
+                self.working['key_info'] = self.working.get('key_info', '') + f"\n[MASTER] {injkeyinfo}"
+            if injprompt:
+                next_prompt += f"\n\n[MASTER] {injprompt}\n"
+            self.parent.intervene = self.parent.extrakeyinfo = None
         for hook in list(getattr(self.parent, '_turn_end_hooks', {}).values()): hook(locals())  # current readonly
         return next_prompt
 
-def get_global_memory():
+def get_global_memory(memory_dir=None, cwd=None):
     prompt = "\n"
+    memory_dir = os.path.abspath(memory_dir or os.environ.get("GA_MEMORY_DIR") or os.path.join(script_dir, "memory"))
     try:
         suffix = '_en' if os.environ.get('GA_LANG', '') == 'en' else ''
-        with open(os.path.join(script_dir, 'memory/global_mem_insight.txt'), 'r', encoding='utf-8', errors='replace') as f: insight = f.read()
-        with open(os.path.join(script_dir, f'assets/insight_fixed_structure{suffix}.txt'), 'r', encoding='utf-8') as f: structure = f.read()
-        prompt += f'cwd = {os.path.join(script_dir, "temp")} (./)\n'
-        prompt += f"\n[Memory] (../memory)\n"
-        prompt += structure + '\n../memory/global_mem_insight.txt:\n'
-        prompt += insight + "\n"
-    except FileNotFoundError: pass
+        insight_path = os.path.join(memory_dir, 'global_mem_insight.txt')
+        with open(insight_path, 'r', encoding='utf-8', errors='replace') as f:
+            insight = f.read()
+        structure_path = os.path.join(script_dir, f'assets/insight_fixed_structure{suffix}.txt')
+        with open(structure_path, 'r', encoding='utf-8') as f:
+            structure = f.read()
+        prompt += f'cwd = {os.path.abspath(cwd or os.environ.get("GA_WORKSPACE") or os.path.join(script_dir, "temp"))} (./)\n'
+        prompt += f"\n[Memory] ({memory_dir})\n"
+        prompt += structure + f'\n{insight_path}:\n' + insight + "\n"
+    except FileNotFoundError:
+        pass
     return prompt
