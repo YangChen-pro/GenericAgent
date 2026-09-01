@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,9 +18,12 @@ class Decision:
     action: str
     reason: str = ""
     correction: str = ""
-    level: str = "constraint"
+    level: str | None = None
     target: str = ""
 
+    def __post_init__(self) -> None:
+        if self.action == "intervene" and self.level is None:
+            object.__setattr__(self, "level", "constraint")
 
 
 class SupervisionAudit:
@@ -71,12 +73,14 @@ class ProgressiveSupervisor:
         self.history: list[dict[str, Any]] = []
         self.last_level: str | None = None
         self.audit = SupervisionAudit(recorder.logs_dir / "supervision.jsonl")
+        self._token_totals = {"prompt": 0, "completion": 0, "cached": 0}
         self._set_system_prompt()
 
     def evaluate(self, trigger: str, target: str, state: str = "") -> Decision:
         check_id = str(uuid.uuid4())
         snapshot = self._snapshot(trigger, target, state)
         self.audit.emit(check_id, "check_started", {"trigger": trigger, "target": target})
+        self.audit.emit(check_id, "snapshot", snapshot)
         prompt = self._decision_prompt(snapshot)
         response = None
         error = None
@@ -128,6 +132,7 @@ class ProgressiveSupervisor:
         response = None
         for round_number in range(self.max_tool_rounds + 1):
             response = self._chat(prompt, tool_results)
+            metrics = self._record_usage(response)
             self.audit.emit(
                 check_id,
                 "model_response",
@@ -135,6 +140,7 @@ class ProgressiveSupervisor:
                     "round": round_number,
                     "content": response.content,
                     "reasoning": response.thinking,
+                    "metrics": metrics,
                 },
                 attempt,
             )
@@ -194,7 +200,13 @@ class ProgressiveSupervisor:
             "modify files. Judge observable progress, tool results, and artifacts. "
             "Do not inspect hidden tests, verifier files, solutions, or grading data. "
             "A reasonable diagnostic step is progress; repeated work without a new "
-            "artifact is drift. Any correction must be short and actionable.\n\n"
+            "artifact is drift. For regex- or parser-based work, completion requires "
+            "timeout-bounded performance evidence on malformed input, unclosed "
+            "structures, and long repeated input. If a check produces no output or "
+            "sustained CPU use, intervene and require a complexity-bounded linear "
+            "scanner or state machine instead of ambiguous nested quantifiers. Never "
+            "reveal, quote, or invent hidden verifier cases. Any correction must be "
+            "short and actionable.\n\n"
             + memory
         )
 
@@ -232,13 +244,39 @@ class ProgressiveSupervisor:
             level_rule += " Approve only if required artifacts and evidence are complete."
         return (
             f"{level_rule}\n"
-            "Return only JSON with keys action, reason, correction, level, target. "
-            "action is continue or intervene. continue requires empty correction. "
+            "Return exactly one JSON object with keys action, reason, correction, "
+            "level, target and no surrounding prose or Markdown. action is continue "
+            "or intervene. continue requires empty correction and level=null. "
             "constraint states the violated requirement and missing evidence only; "
             "procedure may give a method; answer may give a concrete recovery direction "
             "but never a hidden answer.\nSnapshot:\n"
             + json.dumps(snapshot, ensure_ascii=False)
         )
+
+    @staticmethod
+    def _response_metrics(response: Any) -> dict[str, int]:
+        usage = getattr(response, "usage", None)
+        if not isinstance(usage, dict):
+            return {}
+        return {
+            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+            "completion_tokens": int(usage.get("completion_tokens") or 0),
+            "cached_tokens": int(usage.get("cached_tokens") or 0),
+        }
+
+    def _record_usage(self, response: Any) -> dict[str, int]:
+        metrics = self._response_metrics(response)
+        self._token_totals["prompt"] += metrics.get("prompt_tokens", 0)
+        self._token_totals["completion"] += metrics.get("completion_tokens", 0)
+        self._token_totals["cached"] += metrics.get("cached_tokens", 0)
+        return metrics
+
+    def token_metrics(self) -> dict[str, int]:
+        return {
+            "total_prompt_tokens": self._token_totals["prompt"],
+            "total_completion_tokens": self._token_totals["completion"],
+            "total_cached_tokens": self._token_totals["cached"],
+        }
 
     def _parse_decision(self, text: str, trigger: str, target: str) -> Decision:
         payload = self._json_object(text)
@@ -253,7 +291,7 @@ class ProgressiveSupervisor:
         if action == "intervene":
             level = self._next_level() if trigger == "follow_up" else "constraint"
         else:
-            level = "constraint"
+            level = None
         return Decision(
             action=action,
             reason=str(payload.get("reason") or ""),
@@ -269,16 +307,10 @@ class ProgressiveSupervisor:
 
     @staticmethod
     def _json_object(text: str) -> dict[str, Any]:
-        candidates = [text.strip(), *re.findall(r"```(?:json)?\s*(.*?)```", text, re.S)]
-        decoder = json.JSONDecoder()
-        for candidate in reversed(candidates):
-            for index, char in enumerate(candidate):
-                if char != "{":
-                    continue
-                try:
-                    value, _ = decoder.raw_decode(candidate, index)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(value, dict):
-                    return value
-        raise ValueError("Supervisor did not return a JSON object")
+        try:
+            value = json.loads(text.strip())
+        except json.JSONDecodeError as error:
+            raise ValueError("Supervisor did not return exactly one JSON object") from error
+        if not isinstance(value, dict):
+            raise ValueError("Supervisor decision must be a JSON object")
+        return value

@@ -688,20 +688,23 @@ class BaseSession:
         self.stream_observer = None
         self.should_stop = lambda: False
         self.active_response = None
-        self._stream_capture = {"reasoning": "", "content": ""}
+        self._stream_capture = {"reasoning": [], "content": []}
+        self.retain_raw_response = True
     def reset_stream_capture(self):
-        self._stream_capture = {"reasoning": "", "content": ""}
+        self._stream_capture = {"reasoning": [], "content": []}
     def capture_stream(self, kind, text):
         if kind in self._stream_capture and text:
-            self._stream_capture[kind] += text
+            self._stream_capture[kind].append(text)
         if self.stream_observer is not None:
             self.stream_observer(kind, text)
     def partial_stream_blocks(self):
         blocks = []
-        if self._stream_capture["reasoning"]:
-            blocks.append({"type": "thinking", "thinking": self._stream_capture["reasoning"]})
-        if self._stream_capture["content"]:
-            blocks.append({"type": "text", "text": self._stream_capture["content"]})
+        reasoning = "".join(self._stream_capture["reasoning"])
+        content = "".join(self._stream_capture["content"])
+        if reasoning:
+            blocks.append({"type": "thinking", "thinking": reasoning})
+        if content:
+            blocks.append({"type": "text", "text": content})
         return blocks
     def _apply_claude_thinking(self, payload):
         if self.thinking_type:
@@ -897,8 +900,14 @@ class NativeClaudeSession(BaseSession):
             if think_match:
                 thinking = think_match.group(1).strip()
                 content = re.sub(think_pattern, "", content, flags=re.DOTALL)
-        raw = "[" + ",\n".join(repr(b) for b in content_blocks) + "]"
-        return MockResponse(thinking, content, tool_calls, raw)
+        raw = (
+            "[" + ",\n".join(repr(b) for b in content_blocks) + "]"
+            if self.retain_raw_response
+            else ""
+        )
+        response = MockResponse(thinking, content, tool_calls, raw)
+        self.reset_stream_capture()
+        return response
 
 class NativeOAISession(NativeClaudeSession):
     native_ua = "codex_exec/0.139.0 (Windows 10.0.26200; x86_64) unknown (codex_exec; 0.139.0)"
@@ -1207,18 +1216,21 @@ The reply body should first include a minimal one-line (<30 words) physical snap
 class NativeToolClient:
     @staticmethod
     def _thinking_prompt(): return THINKING_PROMPT_EN if os.environ.get('GA_LANG') == 'en' else THINKING_PROMPT_ZH
-    def __init__(self, backend):
+    def __init__(self, backend, include_worker_protocol=True):
         self.backend = backend
-        self.backend.system = self._thinking_prompt()
+        self.include_worker_protocol = include_worker_protocol
+        self.backend.system = self._thinking_prompt() if include_worker_protocol else ""
         self.name = self.backend.name
         self._pending_tool_ids = []
         self.log_path = None
     def set_system(self, extra_system):
-        combined = f"{extra_system}\n\n{self._thinking_prompt()}" if extra_system else self._thinking_prompt()
+        protocol = self._thinking_prompt() if self.include_worker_protocol else ""
+        combined = f"{extra_system}\n\n{protocol}" if extra_system and protocol else extra_system or protocol
         if combined != self.backend.system: print(f"[Debug] Updated system prompt, length {len(combined)} chars.")
         self.backend.system = combined
     def chat(self, messages, tools=None):
         if tools: self.backend.tools = tools
+        STATS.update(inp=0, cached=0, out=0)
         if not self.backend.history: self._pending_tool_ids = []
         combined_content = []; resp = None; tool_results = []
         for msg in messages:
@@ -1249,7 +1261,13 @@ class NativeToolClient:
             while True: 
                 chunk = next(gen); yield chunk
         except StopIteration as e: resp = e.value
-        if resp: _write_llm_log('Response', resp.raw, self.log_path, model=self.backend.model)
+        if resp:
+            resp.usage = {
+                "prompt_tokens": int(STATS.get("inp") or 0),
+                "cached_tokens": int(STATS.get("cached") or 0),
+                "completion_tokens": int(STATS.get("out") or 0),
+            }
+            _write_llm_log('Response', resp.raw, self.log_path, model=self.backend.model)
         if resp and hasattr(resp, 'tool_calls') and resp.tool_calls: self._pending_tool_ids = [tc.id for tc in resp.tool_calls]
         return resp
 

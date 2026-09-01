@@ -70,4 +70,9 @@ def env_model_config(role: str = "worker") -> dict[str, Any]:
 
 def build_client(role: str = "worker") -> NativeToolClient:
     """Build a fresh native tool client; worker and supervisor never share history."""
-    return NativeToolClient(NativeOAISession(env_model_config(role)))
+    session = NativeOAISession(env_model_config(role))
+    session.retain_raw_response = False
+    return NativeToolClient(
+        session,
+        include_worker_protocol=role != "supervisor",
+    )

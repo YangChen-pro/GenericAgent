@@ -42,7 +42,6 @@ class EventRecorder:
         self._draft: dict[str, Any] | None = None
         self._sequence = 0
         self._lock = threading.RLock()
-        self._last_live_write = 0.0
         self._totals = {"prompt": 0, "completion": 0, "cached": 0}
 
     def emit(self, kind: str, **payload: Any) -> dict[str, Any]:
@@ -58,7 +57,13 @@ class EventRecorder:
             self._events.append(event)
             with self.events_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(event, ensure_ascii=False) + "\n")
-            self._write_trajectory_locked()
+            if kind in {
+                "user_prompt",
+                "supervisor_correction",
+                "manual_correction",
+                "assistant",
+            }:
+                self._write_trajectory_locked()
             return event
 
     def begin_assistant(self, turn: int) -> None:
@@ -66,23 +71,8 @@ class EventRecorder:
             self._draft = {
                 "turn": turn,
                 "timestamp": utc_now(),
-                "reasoning": "",
-                "content": "",
+                "started_monotonic": time.monotonic(),
             }
-            self._write_trajectory_locked()
-
-    def stream_delta(self, kind: str, text: str) -> None:
-        if not text:
-            return
-        with self._lock:
-            if self._draft is None:
-                return
-            field = "reasoning" if kind == "reasoning" else "content"
-            self._draft[field] += text
-            now = time.monotonic()
-            if now - self._last_live_write >= 0.5:
-                self._write_trajectory_locked()
-                self._last_live_write = now
 
     def finish_assistant(
         self,
@@ -96,7 +86,19 @@ class EventRecorder:
         interrupted: bool = False,
     ) -> None:
         with self._lock:
+            draft = self._draft
             self._draft = None
+        started_at = (
+            draft["timestamp"]
+            if draft is not None and draft.get("turn") == turn
+            else utc_now()
+        )
+        duration_ms = None
+        if draft is not None and draft.get("turn") == turn:
+            duration_ms = max(
+                0,
+                round((time.monotonic() - draft["started_monotonic"]) * 1000),
+            )
         metrics = metrics or {}
         self._totals["prompt"] += int(metrics.get("prompt_tokens") or 0)
         self._totals["completion"] += int(metrics.get("completion_tokens") or 0)
@@ -104,6 +106,8 @@ class EventRecorder:
         self.emit(
             "assistant",
             turn=turn,
+            started_at=started_at,
+            duration_ms=duration_ms,
             reasoning=reasoning,
             content=content,
             tool_calls=tool_calls,
@@ -132,14 +136,19 @@ class EventRecorder:
                 visible.append(item)
         return visible
 
+    def worker_metrics(self) -> dict[str, int]:
+        return {
+            "total_prompt_tokens": self._totals["prompt"],
+            "total_completion_tokens": self._totals["completion"],
+            "total_cached_tokens": self._totals["cached"],
+        }
+
     def _write_trajectory_locked(self, final: bool = False) -> None:
         steps: list[dict[str, Any]] = []
         for event in self._events:
             step = self._event_to_step(event, len(steps) + 1)
             if step is not None:
                 steps.append(step)
-        if self._draft is not None:
-            steps.append(self._draft_step(len(steps) + 1))
         if not steps:
             return
         trajectory: dict[str, Any] = {
@@ -152,7 +161,11 @@ class EventRecorder:
                 "model_name": self.model,
             },
             "steps": steps,
-            "extra": {"live": not final, "event_sequence": self._sequence},
+            "extra": {
+                "live": not final,
+                "event_sequence": self._sequence,
+                "worker_metrics": self.worker_metrics(),
+            },
         }
         if final:
             trajectory["final_metrics"] = {
@@ -162,21 +175,6 @@ class EventRecorder:
                 "total_steps": len(steps),
             }
         atomic_write_json(self.trajectory_path, trajectory)
-
-    def _draft_step(self, step_id: int) -> dict[str, Any]:
-        assert self._draft is not None
-        step: dict[str, Any] = {
-            "step_id": step_id,
-            "timestamp": self._draft["timestamp"],
-            "source": "agent",
-            "model_name": self.model,
-            "message": self._draft["content"],
-            "llm_call_count": 1,
-            "extra": {"kind": "assistant", "partial": True},
-        }
-        if self._draft["reasoning"]:
-            step["reasoning_content"] = self._draft["reasoning"]
-        return step
 
     def _event_to_step(
         self, event: dict[str, Any], step_id: int
@@ -213,7 +211,7 @@ class EventRecorder:
         ]
         step: dict[str, Any] = {
             "step_id": step_id,
-            "timestamp": event["timestamp"],
+            "timestamp": event.get("started_at") or event["timestamp"],
             "source": "agent",
             "model_name": self.model,
             "message": event.get("content", ""),
@@ -222,6 +220,9 @@ class EventRecorder:
                 "kind": "assistant",
                 "turn": event.get("turn"),
                 "interrupted": bool(event.get("interrupted")),
+                "started_at": event.get("started_at") or event["timestamp"],
+                "finished_at": event["timestamp"],
+                "duration_ms": event.get("duration_ms"),
             },
         }
         if event.get("reasoning"):

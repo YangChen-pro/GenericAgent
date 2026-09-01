@@ -204,6 +204,7 @@ def _setup_run(args):
         harness_mode=True,
         max_turns=args.max_turns,
     )
+    agent.verbose = False
     supervisor = None
     if not args.no_supervisor:
         supervisor = ProgressiveSupervisor(

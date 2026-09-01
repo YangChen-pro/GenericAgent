@@ -73,8 +73,6 @@ class HarnessControl:
                 return
             self._last_feedback = time.monotonic()
             self._condition.notify_all()
-        if kind in {"reasoning", "content"}:
-            self.recorder.stream_delta(kind, text)
 
     def action_finished(self, action_id: str) -> None:
         with self._condition:
@@ -169,6 +167,9 @@ class HarnessControl:
             "n_interventions": self._interventions,
             "step_interval": self.step_interval,
             "stall_timeout_sec": self.stall_timeout_sec,
+            "token_metrics": (
+                self.supervisor.token_metrics() if self.supervisor is not None else {}
+            ),
         }
 
     def _apply(self, decision: Decision, reason_type: str) -> str:

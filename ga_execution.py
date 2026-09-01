@@ -12,9 +12,16 @@ from ga import GenericAgentHandler, consume_file, format_error, smart_format
 from ga_config import get_system_prompt
 
 
+class _DiscardDisplayQueue:
+    """Queue-shaped sink for CLI/Docker harness runs with no display consumer."""
+
+    def put(self, item) -> None:
+        return None
+
+
 class TaskExecutionMixin:
     def put_task(self, query, source="user", images=None):
-        display_queue = queue.Queue()
+        display_queue = _DiscardDisplayQueue() if self.harness_mode else queue.Queue()
         self.task_queue.put(
             {
                 "query": query,
@@ -95,7 +102,18 @@ class TaskExecutionMixin:
         )
 
     def _chunk_consumer(self, source, display_queue, turn_responses, state):
-        def consume(chunk):
+        if self.harness_mode:
+            def consume_harness(chunk):
+                if consume_file(self.task_dir, "_stop"):
+                    self.abort()
+                if isinstance(chunk, dict) and "turn" in chunk:
+                    state["turn"] = chunk["turn"]
+                elif isinstance(chunk, str):
+                    return
+
+            return consume_harness
+
+        def consume_interactive(chunk):
             if consume_file(self.task_dir, "_stop"):
                 self.abort()
             if isinstance(chunk, dict) and "turn" in chunk:
@@ -122,7 +140,7 @@ class TaskExecutionMixin:
             )
             state["position"] = len(state["full"])
 
-        return consume
+        return consume_interactive
 
     def execute_task(self, raw_query, source="user", display_queue=None, raise_errors=True):
         """Execute one task synchronously and return output plus loop result."""
@@ -130,13 +148,21 @@ class TaskExecutionMixin:
             raise RuntimeError("No model client configured")
         if self.is_running:
             raise RuntimeError("GenericAgent is already running")
-        display_queue = display_queue or queue.Queue()
+        display_queue = (
+            _DiscardDisplayQueue()
+            if self.harness_mode
+            else display_queue or queue.Queue()
+        )
         raw_query = self._handle_slash_cmd(raw_query, display_queue)
         if raw_query is None:
             return {"output": "", "exit_reason": {"result": "COMMAND"}}
         query = self._start_task(raw_query, display_queue)
-        turn_responses = self.all_outputs[-1]["outputs"]
-        state = {"full": "", "position": 0, "turn": 0}
+        turn_responses = [] if self.harness_mode else self.all_outputs[-1]["outputs"]
+        state = (
+            {"turn": 0}
+            if self.harness_mode
+            else {"full": "", "position": 0, "turn": 0}
+        )
         consume = self._chunk_consumer(source, display_queue, turn_responses, state)
         try:
             exit_reason = self._drain(self._build_generator(query), consume)
@@ -156,13 +182,19 @@ class TaskExecutionMixin:
         self._current_queue = display_queue
         self.stop_sig = False
         self.clear_action_interrupt()
-        self.all_outputs.append({"input": query, "outputs": []})
-        self.all_outputs = self.all_outputs[-5000:]
+        if not self.harness_mode:
+            self.all_outputs.append({"input": query, "outputs": []})
+            self.all_outputs = self.all_outputs[-5000:]
         rendered = smart_format(query.replace("\n", " "), max_str_len=200)
         self.history.append(f"[USER]: {rendered}")
         return query
 
     def _finish_task(self, display_queue, source, turns, state, exit_reason):
+        if self.harness_mode:
+            result = {"output": "", "exit_reason": exit_reason}
+            self.last_result = result
+            self.history = self.handler.history_info
+            return result
         if self.inc_out and state["position"] < len(state["full"]):
             display_queue.put(
                 {
@@ -198,6 +230,12 @@ class TaskExecutionMixin:
         }
 
     def _fail_task(self, error, display_queue, source, turns, state, raise_errors):
+        if self.harness_mode:
+            rendered = format_error(error)
+            print(f"Backend Error: {rendered}")
+            if raise_errors:
+                raise error
+            return {"output": "", "error": rendered}
         rendered, item = self._error_item(error, source, turns, state)
         print(f"Backend Error: {rendered}")
         display_queue.put(item)

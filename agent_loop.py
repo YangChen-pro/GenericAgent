@@ -83,17 +83,15 @@ def _tool_calls(response):
     ]
 
 
-def _metrics():
-    try:
-        from llmcore import STATS
-
-        return {
-            "prompt_tokens": int(STATS.get("inp") or 0),
-            "completion_tokens": int(STATS.get("out") or 0),
-            "cached_tokens": int(STATS.get("cached") or 0),
-        }
-    except Exception:
+def _metrics(response):
+    usage = getattr(response, "usage", None)
+    if not isinstance(usage, dict):
         return {}
+    return {
+        "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+        "completion_tokens": int(usage.get("completion_tokens") or 0),
+        "cached_tokens": int(usage.get("cached_tokens") or 0),
+    }
 
 
 def _clear_action_interrupt(handler):
@@ -166,7 +164,9 @@ def _append_tool_result(results, call, outcome):
 def _record_turn(control, turn, response, calls, results):
     stalled = control.take_stall() if control else None
     if control:
-        control.record_turn(turn, response, calls, results, _metrics(), bool(stalled))
+        control.record_turn(
+            turn, response, calls, results, _metrics(response), bool(stalled)
+        )
     return stalled
 
 
