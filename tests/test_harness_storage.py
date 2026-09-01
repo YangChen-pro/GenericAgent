@@ -136,17 +136,32 @@ def test_sensitive_filenames_never_enter_overlay(tmp_path):
     assert not any((delta / "overlay").rglob("*"))
 
 
-def test_harness_mode_disables_browser_tools_by_default(tmp_path):
+def test_harness_mode_disables_browser_tools_and_legacy_model_logs(tmp_path):
+    state_dir = tmp_path / "state"
     agent = GenericAgent(
         client=DummyClient(),
         workspace=tmp_path,
-        state_dir=tmp_path / "state",
+        state_dir=state_dir,
         memory_dir=tmp_path,
         harness_mode=True,
     )
     names = {tool["function"]["name"] for tool in agent.tools_schema}
     assert "web_scan" not in names
     assert "web_execute_js" not in names
+    assert agent.log_path is False
+    assert not (state_dir / "model_responses").exists()
+
+
+def test_interactive_mode_keeps_legacy_model_logs(tmp_path):
+    state_dir = tmp_path / "state"
+    agent = GenericAgent(
+        client=DummyClient(),
+        workspace=tmp_path,
+        state_dir=state_dir,
+        memory_dir=tmp_path,
+    )
+    assert Path(agent.log_path).parent == state_dir / "model_responses"
+    assert (state_dir / "model_responses").is_dir()
 
 
 def test_harness_browser_tools_can_be_explicitly_enabled(tmp_path):
@@ -225,7 +240,7 @@ def test_invalid_supervisor_json_is_retried_and_audited(tmp_path):
     supervisor = ProgressiveSupervisor(
         "task", workspace, memory, recorder, client=client, decision_attempts=2
     )
-    assert client.log_path == str(tmp_path / "logs" / "supervisor-model-responses.txt")
+    assert client.log_path is False
     decision = supervisor.evaluate("step_interval", "step-10", "state")
     assert decision.action == "continue"
     records = [
@@ -234,3 +249,4 @@ def test_invalid_supervisor_json_is_retried_and_audited(tmp_path):
     ]
     assert [record["kind"] for record in records].count("invalid_decision") == 1
     assert [record["kind"] for record in records].count("model_response") == 2
+    assert not (tmp_path / "logs" / "supervisor-model-responses.txt").exists()

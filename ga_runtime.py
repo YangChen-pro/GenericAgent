@@ -98,6 +98,9 @@ class GenericAgent(SessionMixin, TaskExecutionMixin):
         self.tools_schema = load_tool_schema(banned_tools=banned)
 
     def _configure_logging(self):
+        if self.harness_mode:
+            self.log_path = False
+            return
         logid = f"{(time.time_ns() + random.randrange(1_000_000)) % 1_000_000:06d}"
         log_dir = os.path.join(self.state_dir, "model_responses")
         os.makedirs(log_dir, exist_ok=True)

@@ -65,8 +65,7 @@ class ProgressiveSupervisor:
         self.recorder = recorder
         self.tools = ReadOnlyWorkspace(self.workspace, recorder)
         self.client = client or build_client("supervisor")
-        if getattr(self.client, "log_path", None) is None:
-            self.client.log_path = str(recorder.logs_dir / "supervisor-model-responses.txt")
+        self.client.log_path = False
         self.max_tool_rounds = max_tool_rounds
         self.decision_attempts = decision_attempts
         self.history: list[dict[str, Any]] = []

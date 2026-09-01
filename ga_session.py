@@ -35,6 +35,10 @@ class SessionMixin:
     def attach_control(self, control):
         self.control = control
         self.harness_mode = control is not None
+        if self.harness_mode:
+            self.log_path = False
+            if self.llmclient is not None:
+                self.llmclient.log_path = False
         self._configure_session_hooks()
 
     def load_llm_sessions(self):

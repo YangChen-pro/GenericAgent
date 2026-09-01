@@ -119,7 +119,7 @@ def _distill_supervisor_memory(
     )
     agent.verbose = False
     result = agent.execute_task(prompt, source="memory", raise_errors=True)
-    return {"enabled": True, "exit_reason": result.get("exit_reason")}
+    return {"enabled": True, "exit_reason": _json_safe(result.get("exit_reason"))}
 
 
 def _persist_memories(
