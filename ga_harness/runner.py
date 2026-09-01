@@ -165,6 +165,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clean-memory", action="store_true")
     parser.add_argument("--no-memory-write", action="store_true")
     parser.add_argument("--no-supervisor", action="store_true")
+    parser.add_argument(
+        "--enable-browser-tools",
+        action="store_true",
+        help="Enable GA web tools; disabled by default in CLI/Docker harness runs.",
+    )
     parser.add_argument("--max-turns", type=int, default=180)
     return parser
 
@@ -195,6 +200,7 @@ def _setup_run(args):
         memory_dir=worker_memory,
         disable_ask_user=True,
         disable_memory_write=args.no_memory_write,
+        disable_browser_tools=not args.enable_browser_tools,
         harness_mode=True,
         max_turns=args.max_turns,
     )

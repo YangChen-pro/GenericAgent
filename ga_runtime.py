@@ -34,6 +34,7 @@ class GenericAgent(SessionMixin, TaskExecutionMixin):
         control=None,
         disable_ask_user=None,
         disable_memory_write=None,
+        disable_browser_tools=None,
         harness_mode=False,
         max_turns=180,
     ):
@@ -63,11 +64,15 @@ class GenericAgent(SessionMixin, TaskExecutionMixin):
         self.last_result = None
         self.extra_sys_prompts = []
         self.intervene = self.extrakeyinfo = None
-        self._configure_tools(disable_ask_user, disable_memory_write)
+        self._configure_tools(
+            disable_ask_user, disable_memory_write, disable_browser_tools
+        )
         self._configure_logging()
         self._configure_client(client)
 
-    def _configure_tools(self, disable_ask_user, disable_memory_write):
+    def _configure_tools(
+        self, disable_ask_user, disable_memory_write, disable_browser_tools
+    ):
         import sys
 
         disable_ask = (
@@ -80,7 +85,14 @@ class GenericAgent(SessionMixin, TaskExecutionMixin):
             if disable_memory_write is None
             else disable_memory_write
         )
+        disable_browser = (
+            self.harness_mode
+            if disable_browser_tools is None
+            else disable_browser_tools
+        )
         banned = {"ask_user"} if disable_ask else set()
+        if disable_browser:
+            banned.update({"web_scan", "web_execute_js"})
         if disable_memory:
             banned.add("start_long_term_update")
         self.tools_schema = load_tool_schema(banned_tools=banned)

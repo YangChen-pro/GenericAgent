@@ -136,6 +136,32 @@ def test_sensitive_filenames_never_enter_overlay(tmp_path):
     assert not any((delta / "overlay").rglob("*"))
 
 
+def test_harness_mode_disables_browser_tools_by_default(tmp_path):
+    agent = GenericAgent(
+        client=DummyClient(),
+        workspace=tmp_path,
+        state_dir=tmp_path / "state",
+        memory_dir=tmp_path,
+        harness_mode=True,
+    )
+    names = {tool["function"]["name"] for tool in agent.tools_schema}
+    assert "web_scan" not in names
+    assert "web_execute_js" not in names
+
+
+def test_harness_browser_tools_can_be_explicitly_enabled(tmp_path):
+    agent = GenericAgent(
+        client=DummyClient(),
+        workspace=tmp_path,
+        state_dir=tmp_path / "state",
+        memory_dir=tmp_path,
+        disable_browser_tools=False,
+        harness_mode=True,
+    )
+    names = {tool["function"]["name"] for tool in agent.tools_schema}
+    assert {"web_scan", "web_execute_js"} <= names
+
+
 def test_ask_user_and_memory_write_are_independent(tmp_path):
     agent = GenericAgent(
         client=DummyClient(),
@@ -199,6 +225,7 @@ def test_invalid_supervisor_json_is_retried_and_audited(tmp_path):
     supervisor = ProgressiveSupervisor(
         "task", workspace, memory, recorder, client=client, decision_attempts=2
     )
+    assert client.log_path == str(tmp_path / "logs" / "supervisor-model-responses.txt")
     decision = supervisor.evaluate("step_interval", "step-10", "state")
     assert decision.action == "continue"
     records = [
