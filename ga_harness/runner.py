@@ -5,9 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -15,8 +15,9 @@ from typing import Any
 from ga_config import script_dir
 from ga_runtime import GenericAgent
 from ga_harness.control import HarnessControl
+from ga_harness.curator import consolidate_memory, distill_run_memory
 from ga_harness.events import EventRecorder, atomic_write_json, utc_now
-from ga_harness.memory import MemoryWorkspace, merge_delta
+from ga_harness.memory import MemoryBank, publish_store
 from ga_harness.model import build_client, env_model_config
 from ga_harness.supervisor import ProgressiveSupervisor
 
@@ -62,27 +63,19 @@ def _git_commit(root: Path) -> str:
         return "unknown"
 
 
-def _memory_overlay(store: Path | None, role: str, clean: bool) -> Path | None:
-    if store is None or clean:
-        return None
-    path = store / role / "overlay"
-    return path if path.exists() else None
-
-
 def _prepare_memories(args, state_dir: Path):
-    baseline = Path(script_dir) / "memory"
+    source_root = Path(script_dir)
     store = Path(args.memory_store).resolve() if args.memory_store else None
-    root = state_dir / "runtime-memory"
-    worker = MemoryWorkspace(
-        baseline, root, "worker", _memory_overlay(store, "worker", args.clean_memory)
-    )
-    supervisor = MemoryWorkspace(
-        baseline,
-        root,
-        "supervisor",
-        _memory_overlay(store, "supervisor", args.clean_memory),
-    )
-    return baseline, store, worker, supervisor, worker.prepare(), supervisor.prepare()
+    runtime_root = state_dir / "runtime-memory"
+    banks: dict[str, MemoryBank] = {}
+    paths: dict[str, Path] = {}
+    for role in ("worker", "supervisor"):
+        source = getattr(args, f"{role}_memory_source")
+        role_store = store / role if store else None
+        bank = MemoryBank(source_root, runtime_root, role, source, role_store)
+        banks[role] = bank
+        paths[role] = bank.prepare()
+    return source_root, store, banks, paths
 
 
 def _drain_queue(agent: GenericAgent, result: dict[str, Any]) -> None:
@@ -92,63 +85,52 @@ def _drain_queue(agent: GenericAgent, result: dict[str, Any]) -> None:
         print(output, flush=True)
 
 
-def _distill_supervisor_memory(
-    client,
-    memory_dir: Path,
-    state_dir: Path,
-    enabled: bool,
-) -> dict[str, Any]:
-    if not enabled:
-        return {"enabled": False}
-    prompt = (
-        "The supervised run has ended. Maintain your own GA long-term memory now. "
-        "Read memory_management_sop.md and update only durable, task-agnostic lessons "
-        "about supervision quality. Never store the task text, answer, exact commands, "
-        "filenames, constants, verifier information, or grading criteria. If there is "
-        "no safe general lesson, make no change and finish."
-    )
-    agent = GenericAgent(
-        client=client,
-        workspace=memory_dir,
-        state_dir=state_dir / "supervisor-distill",
-        memory_dir=memory_dir,
-        disable_ask_user=True,
-        disable_memory_write=False,
-        harness_mode=True,
-        max_turns=12,
-    )
-    agent.verbose = False
-    result = agent.execute_task(prompt, source="memory", raise_errors=True)
-    return {"enabled": True, "exit_reason": _json_safe(result.get("exit_reason"))}
-
-
 def _persist_memories(
     args,
-    baseline: Path,
-    store: Path | None,
-    workspaces: dict[str, MemoryWorkspace],
-    logs_dir: Path,
+    context,
     base_commit: str,
-    allow_write: bool = True,
+    allow_promote: bool,
 ) -> dict[str, Any]:
-    delta_root = logs_dir / "memory-delta"
-    summaries = {}
-    for role, workspace in workspaces.items():
-        destination = workspace.export_delta(delta_root / role, base_commit)
-        manifest = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
-        summaries[role] = {
+    delta_root = context["logs_dir"] / "memory-delta"
+    summaries: dict[str, Any] = {}
+    for role, bank in context["banks"].items():
+        candidate = bank.export_delta(delta_root / role, base_commit)
+        manifest = json.loads((candidate / "manifest.json").read_text(encoding="utf-8"))
+        promote = allow_promote and getattr(args, f"promote_{role}_memory")
+        item: dict[str, Any] = {
+            "source": getattr(args, f"{role}_memory_source"),
+            "promote": promote,
             "changed": len(manifest["files"]),
             "deleted": len(manifest["deleted"]),
             "rejected": len(manifest.get("rejected", [])),
-            "path": str(destination),
+            "candidate": str(candidate),
         }
-        if store is None or args.no_memory_write or not allow_write:
-            continue
-        target = store / role
-        if args.clean_memory:
-            workspace.export_delta(target, base_commit)
-        else:
-            merge_delta(baseline, target, destination, base_commit, role)
+        if promote:
+            try:
+                if context["store"] is None:
+                    raise ValueError(
+                        f"Cannot promote {role} memory without --memory-store"
+                    )
+                role_store = context["store"] / role
+                with tempfile.TemporaryDirectory(
+                    prefix=f"ga-{role}-promote-", dir=context["state_dir"]
+                ) as temporary:
+                    staged = Path(temporary) / "store"
+                    report = consolidate_memory(
+                        role,
+                        role_store,
+                        None,
+                        [candidate],
+                        staged,
+                        base_commit=base_commit,
+                        source_root=context["source_root"],
+                        state_dir=temporary,
+                    )
+                    item["generation"] = publish_store(staged, role_store)
+                    item["curator"] = report
+            except Exception as error:
+                item["promotion_error"] = f"{type(error).__name__}: {error}"
+        summaries[role] = item
     return summaries
 
 
@@ -162,8 +144,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--logs-dir", required=True)
     parser.add_argument("--env-file")
     parser.add_argument("--memory-store")
-    parser.add_argument("--clean-memory", action="store_true")
-    parser.add_argument("--no-memory-write", action="store_true")
+    for role in ("worker", "supervisor"):
+        parser.add_argument(
+            f"--{role}-memory-source",
+            choices=("initial", "latest"),
+            default="latest",
+        )
+        parser.add_argument(
+            f"--no-promote-{role}-memory",
+            dest=f"promote_{role}_memory",
+            action="store_false",
+            default=True,
+        )
     parser.add_argument("--no-supervisor", action="store_true")
     parser.add_argument(
         "--enable-browser-tools",
@@ -188,8 +180,7 @@ def _setup_run(args):
         if args.instruction_file
         else args.instruction
     )
-    memories = _prepare_memories(args, state_dir)
-    baseline, store, worker_ws, supervisor_ws, worker_memory, supervisor_memory = memories
+    source_root, store, banks, paths = _prepare_memories(args, state_dir)
     model = str(env_model_config("worker")["model"])
     recorder = EventRecorder(logs_dir, model=model)
     recorder.emit("user_prompt", content=instruction, origin="task")
@@ -197,9 +188,9 @@ def _setup_run(args):
         client=build_client("worker"),
         workspace=workspace,
         state_dir=state_dir / "worker",
-        memory_dir=worker_memory,
+        memory_dir=paths["worker"],
         disable_ask_user=True,
-        disable_memory_write=args.no_memory_write,
+        disable_memory_write=False,
         disable_browser_tools=not args.enable_browser_tools,
         harness_mode=True,
         max_turns=args.max_turns,
@@ -208,69 +199,69 @@ def _setup_run(args):
     supervisor = None
     if not args.no_supervisor:
         supervisor = ProgressiveSupervisor(
-            instruction, workspace, supervisor_memory, recorder
+            instruction, workspace, paths["supervisor"], recorder
         )
-    control = HarnessControl.from_env(
-        recorder, supervisor, agent.interrupt_current_action
-    )
+    control = HarnessControl.from_env(recorder, supervisor, agent.interrupt_current_action)
     agent.attach_control(control)
     return {
         "workspace": workspace,
         "state_dir": state_dir,
         "logs_dir": logs_dir,
         "instruction": instruction,
-        "baseline": baseline,
+        "source_root": source_root,
         "store": store,
-        "workspaces": {"worker": worker_ws, "supervisor": supervisor_ws},
-        "supervisor_memory": supervisor_memory,
+        "banks": banks,
         "model": model,
         "recorder": recorder,
         "agent": agent,
         "supervisor": supervisor,
+        "supervisor_distillation": {"enabled": supervisor is not None},
         "control": control,
     }
 
 
-def _execute_run(args, context):
+def _execute_run(context):
     status, error, result = "completed", None, {}
-    distillation = {"enabled": False}
     try:
         result = context["agent"].execute_task(
             context["instruction"], source="task", raise_errors=True
         )
         _drain_queue(context["agent"], result)
         if context["supervisor"] is not None:
-            distillation = _distill_supervisor_memory(
-                context["supervisor"].client,
-                context["supervisor_memory"],
-                context["state_dir"],
-                not args.no_memory_write,
-            )
+            try:
+                context["supervisor_distillation"] = distill_run_memory(
+                    "supervisor",
+                    context["banks"]["supervisor"].root,
+                    [
+                        context["logs_dir"] / "trajectory.json",
+                        context["logs_dir"] / "supervision.jsonl",
+                    ],
+                    source_root=context["source_root"],
+                    state_dir=context["state_dir"],
+                )
+            except Exception as distill_error:
+                context["supervisor_distillation"] = {
+                    "error": f"{type(distill_error).__name__}: {distill_error}"
+                }
     except Exception as caught:
         status = "error"
         error = f"{type(caught).__name__}: {caught}"
         print(error, file=sys.stderr, flush=True)
     finally:
         context["control"].close()
-    return status, error, result, distillation
+    return status, error, result
 
 
 def _finish_run(args, context, timing, outcome):
     started_at, started = timing
-    status, error, result, distillation = outcome
+    status, error, result = outcome
     base_commit = _git_commit(Path(script_dir))
     memory = _persist_memories(
-        args,
-        context["baseline"],
-        context["store"],
-        context["workspaces"],
-        context["logs_dir"],
-        base_commit,
-        allow_write=status == "completed",
+        args, context, base_commit, allow_promote=status == "completed"
     )
     exit_reason = _json_safe(result.get("exit_reason"))
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": status,
         "started_at": started_at,
         "duration_sec": round(time.monotonic() - started, 3),
@@ -279,20 +270,18 @@ def _finish_run(args, context, timing, outcome):
         "supervision": context["control"].summary(),
         "exit_reason": exit_reason,
         "memory": memory,
-        "supervisor_memory_distillation": distillation,
+        "supervisor_memory_distillation": context["supervisor_distillation"],
         "error": error,
     }
     atomic_write_json(context["logs_dir"] / "ga-summary.json", summary)
-    context["recorder"].finalize(
-        status, error=error, exit_reason=exit_reason
-    )
+    context["recorder"].finalize(status, error=error, exit_reason=exit_reason)
     return 0 if status == "completed" else 1
 
 
 def run(args) -> int:
     timing = (utc_now(), time.monotonic())
     context = _setup_run(args)
-    outcome = _execute_run(args, context)
+    outcome = _execute_run(context)
     return _finish_run(args, context, timing, outcome)
 
 

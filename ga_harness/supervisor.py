@@ -65,7 +65,7 @@ class ProgressiveSupervisor:
         self.workspace = Path(workspace).resolve()
         self.memory_dir = Path(memory_dir).resolve()
         self.recorder = recorder
-        self.tools = ReadOnlyWorkspace(self.workspace, recorder)
+        self.tools = ReadOnlyWorkspace(self.workspace, recorder, self.memory_dir)
         self.client = client or build_client("supervisor")
         self.client.log_path = False
         self.max_tool_rounds = max_tool_rounds
@@ -211,13 +211,16 @@ class ProgressiveSupervisor:
         )
 
     def _memory_context(self) -> str:
-        parts = []
-        for name in ("global_mem_insight.txt", "supervisor_sop.md"):
-            path = self.memory_dir / name
-            if path.is_file():
-                content = path.read_text(encoding="utf-8", errors="replace")
-                parts.append(f"[{name}]\n{content}")
-        return "\n\n".join(parts)
+        """Inject only L1; deeper Supervisor memory is available through tools."""
+        path = self.memory_dir / "global_mem_insight.txt"
+        if not path.is_file():
+            return ""
+        content = path.read_text(encoding="utf-8", errors="replace")
+        return (
+            f"[global_mem_insight.txt]\n{content}\n\n"
+            "Use memory_list and memory_read only when L1 points to relevant L2/L3 "
+            "knowledge. Those tools expose this Supervisor bank only."
+        )
 
     def _snapshot(self, trigger: str, target: str, state: str) -> dict[str, Any]:
         return {

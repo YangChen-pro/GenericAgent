@@ -15,7 +15,8 @@ from types import SimpleNamespace
 import pytest
 
 from ga_harness.events import EventRecorder
-from ga_harness.memory import MemoryWorkspace, merge_delta
+from ga_harness.curator import consolidate_memory
+from ga_harness.memory import MemoryBank, publish_store, resolve_store, tree_digest
 from ga_harness.model import build_client, env_model_config
 from ga_harness.supervisor import ProgressiveSupervisor
 from ga_harness.supervisor_tools import ReadOnlyWorkspace
@@ -169,44 +170,110 @@ def test_supervisor_client_does_not_inherit_worker_summary_protocol(monkeypatch)
     assert "<summary>" not in client.backend.system
 
 
-def test_worker_and_supervisor_memory_are_isolated_and_merge(tmp_path):
-    baseline = tmp_path / "baseline"
-    baseline.mkdir()
-    (baseline / "global_mem.txt").write_text("base")
-    state = tmp_path / "state"
-    worker = MemoryWorkspace(baseline, state, "worker")
-    supervisor = MemoryWorkspace(baseline, state, "supervisor")
+def _source_root(tmp_path):
+    source = tmp_path / "source"
+    worker = source / "memory"
+    supervisor = source / "ga_harness" / "supervisor_memory"
+    for root, insight in ((worker, "worker-index"), (supervisor, "supervisor-index")):
+        (root / "L4_raw_sessions").mkdir(parents=True)
+        (root / "global_mem_insight.txt").write_text(insight)
+        (root / "global_mem.txt").write_text("# L2\n")
+    (worker / "memory_management_sop.md").write_text("shared-l0")
+    (worker / "worker_sop.md").write_text("worker-only")
+    (supervisor / "supervisor_sop.md").write_text("supervisor-only")
+    return source
+
+
+def test_role_initial_banks_are_isolated_and_l0_is_shared(tmp_path):
+    source = _source_root(tmp_path)
+    worker = MemoryBank(source, tmp_path / "state", "worker", "initial")
+    supervisor = MemoryBank(source, tmp_path / "state", "supervisor", "initial")
     worker_root, supervisor_root = worker.prepare(), supervisor.prepare()
-    (worker_root / "global_mem.txt").write_text("worker")
-    (worker_root / "new.md").write_text("new")
-    (worker_root / "leak.md").write_text("api_key=abcdefghijklmnop")
-    assert (supervisor_root / "global_mem.txt").read_text() == "base"
-    delta = worker.export_delta(tmp_path / "delta", "abc")
-    manifest = json.loads((delta / "manifest.json").read_text())
-    assert {entry["path"] for entry in manifest["files"]} == {
-        "global_mem.txt",
-        "new.md",
-    }
-    assert manifest["rejected"] == [
-        {"path": "leak.md", "reason": "sensitive_content"}
-    ]
-    store = tmp_path / "store" / "worker"
-    merge_delta(baseline, store, delta, "abc", "worker")
-    assert (store / "overlay" / "global_mem.txt").read_text() == "worker"
+
+    assert (worker_root / "worker_sop.md").read_text() == "worker-only"
+    assert not (worker_root / "supervisor_sop.md").exists()
+    assert (supervisor_root / "supervisor_sop.md").read_text() == "supervisor-only"
+    assert not (supervisor_root / "worker_sop.md").exists()
+    assert (worker_root / "memory_management_sop.md").read_text() == "shared-l0"
+    assert (supervisor_root / "memory_management_sop.md").read_text() == "shared-l0"
 
 
-def test_sensitive_filenames_never_enter_overlay(tmp_path):
-    baseline = tmp_path / "baseline"
-    baseline.mkdir()
-    state = tmp_path / "state"
-    memory = MemoryWorkspace(baseline, state, "worker")
-    root = memory.prepare()
+def test_initial_and_latest_sources_are_independent(tmp_path):
+    source = _source_root(tmp_path)
+    seed = MemoryBank(source, tmp_path / "seed", "worker", "initial")
+    root = seed.prepare()
+    (root / "learned.md").write_text("latest")
+    candidate = seed.export_delta(tmp_path / "candidate", "abc")
+    publish_store(candidate, tmp_path / "store" / "worker")
+
+    initial = MemoryBank(
+        source, tmp_path / "initial-state", "worker", "initial", tmp_path / "store" / "worker"
+    ).prepare()
+    latest = MemoryBank(
+        source, tmp_path / "latest-state", "worker", "latest", tmp_path / "store" / "worker"
+    ).prepare()
+
+    assert not (initial / "learned.md").exists()
+    assert (latest / "learned.md").read_text() == "latest"
+
+
+def test_sensitive_files_and_l0_changes_never_enter_candidate(tmp_path):
+    source = _source_root(tmp_path)
+    bank = MemoryBank(source, tmp_path / "state", "worker", "initial")
+    root = bank.prepare()
     (root / "api_key.md").write_text("not actually a key")
     (root / ".env").write_text("TOKEN=secret")
-    delta = memory.export_delta(tmp_path / "delta", "abc")
-    manifest = json.loads((delta / "manifest.json").read_text())
-    assert manifest["files"] == []
-    assert not any((delta / "overlay").rglob("*"))
+    (root / "memory_management_sop.md").write_text("modified")
+    with pytest.raises(ValueError, match="read-only"):
+        bank.export_delta(tmp_path / "candidate", "abc")
+
+
+def test_curator_semantically_combines_same_file_candidates(tmp_path):
+    source = _source_root(tmp_path)
+    candidates = []
+    for index, lesson in enumerate(("first", "second"), 1):
+        bank = MemoryBank(source, tmp_path / f"state-{index}", "supervisor", "initial")
+        root = bank.prepare()
+        (root / "supervisor_sop.md").write_text(lesson)
+        candidates.append(bank.export_delta(tmp_path / f"candidate-{index}", "abc"))
+
+    def curator(workspace, prompt):
+        assert "candidate-001" in prompt or (workspace / "evidence" / "candidate-001").is_dir()
+        memory = workspace / "memory" / "supervisor_sop.md"
+        values = [
+            (workspace / "evidence" / f"candidate-{i:03d}" / "supervisor_sop.md").read_text()
+            for i in (1, 2)
+        ]
+        memory.write_text("\n".join(values))
+        return {"done": True}
+
+    output = tmp_path / "output"
+    report = consolidate_memory(
+        "supervisor",
+        None,
+        None,
+        candidates,
+        output,
+        base_commit="abc",
+        source_root=source,
+        curator=curator,
+    )
+    latest = MemoryBank(source, tmp_path / "latest", "supervisor", "latest", output).prepare()
+    assert (latest / "supervisor_sop.md").read_text() == "first\nsecond"
+    assert report["candidate_count"] == 2
+
+
+def test_publish_store_switches_valid_current_generation(tmp_path):
+    source = _source_root(tmp_path)
+    bank = MemoryBank(source, tmp_path / "state", "worker", "initial")
+    root = bank.prepare()
+    (root / "learned.md").write_text("v1")
+    candidate = bank.export_delta(tmp_path / "candidate", "abc")
+    generation = publish_store(candidate, tmp_path / "store" / "worker")
+    assert resolve_store(tmp_path / "store" / "worker") == (
+        tmp_path / "store" / "worker" / "versions" / generation
+    ).resolve()
+    assert tree_digest(resolve_store(tmp_path / "store" / "worker")) == generation
 
 
 def test_harness_mode_disables_browser_tools_and_legacy_model_logs(tmp_path):
@@ -291,14 +358,30 @@ def test_supervisor_cannot_escape_or_read_verifier(tmp_path):
     (workspace / "visible.txt").write_text("ok")
     (workspace / "verifier").mkdir()
     (workspace / "verifier" / "secret.txt").write_text("answer")
+    memory = tmp_path / "supervisor-memory"
+    memory.mkdir()
+    (memory / "global_mem_insight.txt").write_text("L1")
+    (memory / "global_mem.txt").write_text("L2")
+    (memory / "supervisor_sop.md").write_text("L3")
+    (memory / "L4_raw_sessions").mkdir()
     recorder = EventRecorder(tmp_path / "logs", "model")
-    tools = ReadOnlyWorkspace(workspace, recorder)
+    tools = ReadOnlyWorkspace(workspace, recorder, memory)
     assert tools.call("read_file", {"path": "visible.txt"}) == "ok"
-    assert "escapes" in tools.call("read_file", {"path": "../outside"})
+    assert "parent traversal" in tools.call("read_file", {"path": "../outside"})
     assert "unavailable" in tools.call(
         "read_file", {"path": "verifier/secret.txt"}
     )
     assert "verifier" not in tools.list_directory({"path": "."})
+    assert tools.call("memory_read", {"path": "global_mem.txt"}) == "L2"
+    assert tools.call("memory_read", {"path": "supervisor_sop.md"}) == "L3"
+    assert "Only this Supervisor" in tools.call(
+        "memory_read", {"path": "global_mem_insight.txt"}
+    )
+    assert "Only this Supervisor" in tools.call(
+        "memory_read", {"path": "L4_raw_sessions/hidden.md"}
+    )
+    assert "Absolute paths" in tools.call("memory_read", {"path": "/tmp/x"})
+    assert "Absolute paths" in tools.call("memory_read", {"path": "../worker/x"})
 
 
 def test_invalid_supervisor_json_is_retried_and_audited(tmp_path):
@@ -321,6 +404,7 @@ def test_invalid_supervisor_json_is_retried_and_audited(tmp_path):
     assert decision.action == "continue"
     assert decision.level is None
     assert "<summary>" not in client.system
+    assert "supervisor_sop.md" not in client.system
     records = [
         json.loads(line)
         for line in (tmp_path / "logs" / "supervision.jsonl").read_text().splitlines()
@@ -440,3 +524,57 @@ def test_stream_capture_uses_chunks_and_is_cleared_after_response(monkeypatch):
     assert response.content == "c"
     assert response.raw == ""
     assert session._stream_capture == {"reasoning": [], "content": []}
+
+
+def test_standalone_memory_defaults_are_latest_and_independently_promoted():
+    from ga_harness.runner import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "--instruction",
+            "task",
+            "--workspace",
+            ".",
+            "--state-dir",
+            "state",
+            "--logs-dir",
+            "logs",
+        ]
+    )
+    assert args.worker_memory_source == "latest"
+    assert args.supervisor_memory_source == "latest"
+    assert args.promote_worker_memory is True
+    assert args.promote_supervisor_memory is True
+
+
+@pytest.mark.parametrize(
+    ("worker_flag", "supervisor_flag", "worker_expected", "supervisor_expected"),
+    [
+        (False, False, True, True),
+        (True, False, False, True),
+        (False, True, True, False),
+        (True, True, False, False),
+    ],
+)
+def test_standalone_memory_promotion_switches_are_independent(
+    worker_flag, supervisor_flag, worker_expected, supervisor_expected
+):
+    from ga_harness.runner import build_parser
+
+    argv = [
+        "--instruction",
+        "task",
+        "--workspace",
+        ".",
+        "--state-dir",
+        "state",
+        "--logs-dir",
+        "logs",
+    ]
+    if worker_flag:
+        argv.append("--no-promote-worker-memory")
+    if supervisor_flag:
+        argv.append("--no-promote-supervisor-memory")
+    args = build_parser().parse_args(argv)
+    assert args.promote_worker_memory is worker_expected
+    assert args.promote_supervisor_memory is supervisor_expected
