@@ -7,7 +7,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -15,9 +14,10 @@ from typing import Any
 from ga_config import script_dir
 from ga_runtime import GenericAgent
 from ga_harness.control import HarnessControl
-from ga_harness.curator import consolidate_memory, distill_run_memory
+from ga_harness.curator import distill_run_memory
+from ga_harness.promotion import promote_memory
 from ga_harness.events import EventRecorder, atomic_write_json, utc_now
-from ga_harness.memory import MemoryBank, publish_store
+from ga_harness.memory import MemoryBank
 from ga_harness.model import build_client, env_model_config
 from ga_harness.supervisor import ProgressiveSupervisor
 
@@ -66,12 +66,14 @@ def _git_commit(root: Path) -> str:
 def _prepare_memories(args, state_dir: Path):
     source_root = Path(script_dir)
     store = Path(args.memory_store).resolve() if args.memory_store else None
+    snapshot = Path(args.memory_snapshot).resolve() if args.memory_snapshot else None
     runtime_root = state_dir / "runtime-memory"
     banks: dict[str, MemoryBank] = {}
     paths: dict[str, Path] = {}
     for role in ("worker", "supervisor"):
         source = getattr(args, f"{role}_memory_source")
-        role_store = store / role if store else None
+        load_root = snapshot if snapshot is not None else store
+        role_store = load_root / role if load_root else None
         bank = MemoryBank(source_root, runtime_root, role, source, role_store)
         banks[role] = bank
         paths[role] = bank.prepare()
@@ -94,42 +96,44 @@ def _persist_memories(
     delta_root = context["logs_dir"] / "memory-delta"
     summaries: dict[str, Any] = {}
     for role, bank in context["banks"].items():
-        candidate = bank.export_delta(delta_root / role, base_commit)
-        manifest = json.loads((candidate / "manifest.json").read_text(encoding="utf-8"))
         promote = allow_promote and getattr(args, f"promote_{role}_memory")
         item: dict[str, Any] = {
             "source": getattr(args, f"{role}_memory_source"),
             "promote": promote,
-            "changed": len(manifest["files"]),
-            "deleted": len(manifest["deleted"]),
-            "rejected": len(manifest.get("rejected", [])),
-            "candidate": str(candidate),
         }
-        if promote:
-            try:
+        try:
+            candidate = bank.export_delta(delta_root / role, base_commit)
+            manifest = json.loads(
+                (candidate / "manifest.json").read_text(encoding="utf-8")
+            )
+            item.update(
+                changed=len(manifest["files"]),
+                deleted=len(manifest["deleted"]),
+                rejected=len(manifest.get("rejected", [])),
+                candidate=str(candidate),
+            )
+            if promote:
                 if context["store"] is None:
                     raise ValueError(
                         f"Cannot promote {role} memory without --memory-store"
                     )
                 role_store = context["store"] / role
-                with tempfile.TemporaryDirectory(
-                    prefix=f"ga-{role}-promote-", dir=context["state_dir"]
-                ) as temporary:
-                    staged = Path(temporary) / "store"
-                    report = consolidate_memory(
-                        role,
-                        role_store,
-                        None,
-                        [candidate],
-                        staged,
-                        base_commit=base_commit,
-                        source_root=context["source_root"],
-                        state_dir=temporary,
-                    )
-                    item["generation"] = publish_store(staged, role_store)
-                    item["curator"] = report
-            except Exception as error:
-                item["promotion_error"] = f"{type(error).__name__}: {error}"
+                report = promote_memory(
+                    role,
+                    role_store,
+                    None,
+                    [candidate],
+                    base_commit=base_commit,
+                    promotion_id=context["recorder"].session_id,
+                    source_root=context["source_root"],
+                    state_dir=context["state_dir"],
+                )
+                item["generation"] = report.get("output_sha256")
+                item["curator"] = report
+        except Exception as error:
+            # Memory is an auxiliary self-evolution channel. Keep the task result
+            # and old latest intact, while making the failure fully auditable.
+            item["error"] = f"{type(error).__name__}: {error}"
         summaries[role] = item
     return summaries
 
@@ -143,7 +147,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--logs-dir", required=True)
     parser.add_argument("--env-file")
-    parser.add_argument("--memory-store")
+    parser.add_argument(
+        "--memory-store",
+        default=os.environ.get("GA_MEMORY_STORE")
+        or str(Path(script_dir) / ".ga-memory"),
+    )
+    parser.add_argument("--memory-snapshot")
     for role in ("worker", "supervisor"):
         parser.add_argument(
             f"--{role}-memory-source",

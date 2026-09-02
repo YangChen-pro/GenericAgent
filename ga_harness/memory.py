@@ -159,21 +159,50 @@ def _apply_store(store: str | Path | None, target: Path, role: MemoryRole) -> No
             shutil.rmtree(path)
 
 
+def _validate_structure(root: Path, role: MemoryRole) -> None:
+    for required in (L0_NAME, L1_NAME, L2_NAME):
+        path = root / required
+        if not path.is_file() or path.is_symlink():
+            raise ValueError(f"{role} memory is missing {required}")
+    if len((root / L1_NAME).read_text(encoding="utf-8").splitlines()) > 30:
+        raise ValueError(f"{role} memory L1 exceeds 30 lines")
+
+
+def _validate_contract(root: Path, source_root: str | Path, role: MemoryRole) -> None:
+    _validate_structure(root, role)
+    if file_digest(root / L0_NAME) != file_digest(shared_l0_path(source_root)):
+        raise ValueError(f"{role} memory modified shared read-only {L0_NAME}")
+
+
+def _rejection_reason(
+    relative: Path, path: Path, initial: Path | None = None
+) -> str | None:
+    if path.is_symlink():
+        return "symlink"
+    if not path.is_file():
+        return None
+    if not _included(relative):
+        return "sensitive_or_unsupported_path"
+    unchanged_initial = (
+        initial is not None and initial.is_file() and file_digest(initial) == file_digest(path)
+    )
+    if _contains_secret(path) and not unchanged_initial:
+        return "sensitive_content"
+    return None
+
+
 def validate_memory(root: str | Path, source_root: str | Path, role: MemoryRole) -> None:
     """Fail closed when a materialized bank violates the shared layer contract."""
     memory = Path(root).resolve()
-    for required in (L0_NAME, L1_NAME, L2_NAME):
-        if not (memory / required).is_file():
-            raise ValueError(f"{role} memory is missing {required}")
-    if file_digest(memory / L0_NAME) != file_digest(shared_l0_path(source_root)):
-        raise ValueError(f"{role} memory modified shared read-only {L0_NAME}")
-    if len((memory / L1_NAME).read_text(encoding="utf-8").splitlines()) > 30:
-        raise ValueError(f"{role} memory L1 exceeds 30 lines")
+    _validate_contract(memory, source_root, role)
+    initial_files = memory_files(role_initial_root(source_root, role))
     for path in memory.rglob("*"):
-        if path.is_symlink():
-            raise ValueError(f"{role} memory contains a symlink: {path}")
-        if path.is_file() and (not _included(path.relative_to(memory)) or _contains_secret(path)):
-            raise ValueError(f"{role} memory contains a rejected file: {path.name}")
+        relative = path.relative_to(memory)
+        reason = _rejection_reason(relative, path, initial_files.get(relative.as_posix()))
+        if reason is not None:
+            raise ValueError(
+                f"{role} memory contains a rejected file: {path.name} ({reason})"
+            )
 
 
 class MemoryBank:
@@ -209,9 +238,64 @@ class MemoryBank:
         validate_memory(self.root, self.source_root, self.role)
         return self.root
 
+    def _initial_snapshot(self, staging: Path) -> Path:
+        initial_root = staging / ".initial"
+        initial_root.mkdir(parents=True)
+        copy_memory(self.initial, initial_root)
+        shutil.copy2(shared_l0_path(self.source_root), initial_root / L0_NAME)
+        validate_memory(initial_root, self.source_root, self.role)
+        return initial_root
+
+    def _delta_entries(
+        self, initial_files: dict[str, Path], overlay_dir: Path
+    ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, str]]]:
+        changed: list[dict[str, Any]] = []
+        rejected: list[dict[str, str]] = []
+        accepted: set[str] = set()
+        for path in sorted(self.root.rglob("*")):
+            relative_path = path.relative_to(self.root)
+            relative = relative_path.as_posix()
+            if relative == L0_NAME:
+                accepted.add(relative)
+                if file_digest(path) != file_digest(shared_l0_path(self.source_root)):
+                    rejected.append({"path": relative, "reason": "shared_read_only"})
+                continue
+            initial = initial_files.get(relative)
+            reason = _rejection_reason(relative_path, path, initial)
+            if reason is not None:
+                rejected.append({"path": relative, "reason": reason})
+                continue
+            if not path.is_file():
+                continue
+            accepted.add(relative)
+            digest = file_digest(path)
+            if initial is not None and digest == file_digest(initial):
+                continue
+            target = overlay_dir / relative_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+            changed.append(
+                {
+                    "path": relative,
+                    "status": "modified" if initial else "added",
+                    "sha256": digest,
+                }
+            )
+        deleted = sorted((set(initial_files) - accepted) - {L0_NAME})
+        return changed, deleted, rejected
+
+    @staticmethod
+    def _replace_candidate(staging: Path, destination: Path) -> None:
+        if destination.exists() or destination.is_symlink():
+            if destination.is_dir() and not destination.is_symlink():
+                shutil.rmtree(destination)
+            else:
+                destination.unlink()
+        os.replace(staging, destination)
+
     def export_delta(self, destination: str | Path, base_commit: str) -> Path:
-        """Export a full role state as a sparse delta over that role's initial bank."""
-        validate_memory(self.root, self.source_root, self.role)
+        """Export a full role state as a sparse delta over its initial bank."""
+        _validate_structure(self.root, self.role)
         destination = Path(destination).resolve()
         staging = destination.with_name(
             f".{destination.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
@@ -219,36 +303,9 @@ class MemoryBank:
         shutil.rmtree(staging, ignore_errors=True)
         overlay_dir = staging / "overlay"
         overlay_dir.mkdir(parents=True)
-        initial_root = staging / ".initial"
-        initial_root.mkdir(parents=True)
-        copy_memory(self.initial, initial_root)
-        shutil.copy2(shared_l0_path(self.source_root), initial_root / L0_NAME)
-        validate_memory(initial_root, self.source_root, self.role)
+        initial_root = self._initial_snapshot(staging)
         initial_files = memory_files(initial_root)
-        runtime_files = memory_files(self.root)
-        changed: list[dict[str, Any]] = []
-        rejected: list[dict[str, str]] = []
-        for relative, runtime_path in sorted(runtime_files.items()):
-            if relative == L0_NAME:
-                continue
-            if _contains_secret(runtime_path):
-                rejected.append({"path": relative, "reason": "sensitive_content"})
-                continue
-            initial_path = initial_files.get(relative)
-            digest = file_digest(runtime_path)
-            if initial_path is not None and digest == file_digest(initial_path):
-                continue
-            target = overlay_dir / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(runtime_path, target)
-            changed.append(
-                {
-                    "path": relative,
-                    "status": "modified" if initial_path else "added",
-                    "sha256": digest,
-                }
-            )
-        deleted = sorted((set(initial_files) - set(runtime_files)) - {L0_NAME})
+        changed, deleted, rejected = self._delta_entries(initial_files, overlay_dir)
         initial_digest = tree_digest(initial_root)
         shutil.rmtree(initial_root)
         manifest = {
@@ -264,12 +321,7 @@ class MemoryBank:
             "rejected": rejected,
         }
         atomic_write_json(staging / "manifest.json", manifest)
-        if destination.exists() or destination.is_symlink():
-            if destination.is_dir() and not destination.is_symlink():
-                shutil.rmtree(destination)
-            else:
-                destination.unlink()
-        os.replace(staging, destination)
+        self._replace_candidate(staging, destination)
         return destination
 
 

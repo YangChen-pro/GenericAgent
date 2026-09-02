@@ -1,3 +1,4 @@
+# ruff: noqa: E402
 import sys
 
 # A legacy frontend test installs collection-time module stubs. Restore the real
@@ -19,7 +20,7 @@ from ga_harness.curator import consolidate_memory
 from ga_harness.memory import MemoryBank, publish_store, resolve_store, tree_digest
 from ga_harness.model import build_client, env_model_config
 from ga_harness.supervisor import ProgressiveSupervisor
-from ga_harness.supervisor_tools import ReadOnlyWorkspace
+from ga_harness.supervisor_tools import READ_ONLY_TOOLS, ReadOnlyWorkspace
 from ga_runtime import GenericAgent
 
 
@@ -224,8 +225,17 @@ def test_sensitive_files_and_l0_changes_never_enter_candidate(tmp_path):
     (root / "api_key.md").write_text("not actually a key")
     (root / ".env").write_text("TOKEN=secret")
     (root / "memory_management_sop.md").write_text("modified")
-    with pytest.raises(ValueError, match="read-only"):
-        bank.export_delta(tmp_path / "candidate", "abc")
+
+    candidate = bank.export_delta(tmp_path / "candidate", "abc")
+    manifest = json.loads((candidate / "manifest.json").read_text())
+
+    assert manifest["files"] == []
+    assert {item["path"] for item in manifest["rejected"]} == {
+        ".env",
+        "api_key.md",
+        "memory_management_sop.md",
+    }
+    assert not any((candidate / "overlay").iterdir())
 
 
 def test_curator_semantically_combines_same_file_candidates(tmp_path):
@@ -578,3 +588,278 @@ def test_standalone_memory_promotion_switches_are_independent(
     args = build_parser().parse_args(argv)
     assert args.promote_worker_memory is worker_expected
     assert args.promote_supervisor_memory is supervisor_expected
+
+
+def test_initial_run_promotion_rebases_on_current_latest(tmp_path):
+    from ga_harness.promotion import promote_memory
+
+    source = _source_root(tmp_path)
+    latest_bank = MemoryBank(source, tmp_path / "latest-seed", "worker", "initial")
+    latest_root = latest_bank.prepare()
+    (latest_root / "existing.md").write_text("keep-existing")
+    latest_candidate = latest_bank.export_delta(tmp_path / "latest-candidate", "abc")
+    store = tmp_path / "store" / "worker"
+    publish_store(latest_candidate, store)
+
+    trial_bank = MemoryBank(source, tmp_path / "trial", "worker", "initial")
+    trial_root = trial_bank.prepare()
+    (trial_root / "new.md").write_text("new-candidate")
+    trial_candidate = trial_bank.export_delta(tmp_path / "trial-candidate", "abc")
+
+    def curator(workspace, prompt):
+        memory = workspace / "memory"
+        assert (memory / "existing.md").read_text() == "keep-existing"
+        candidate = workspace / "evidence" / "candidate-001" / "new.md"
+        (memory / "new.md").write_text(candidate.read_text())
+        return {"done": True}
+
+    first = promote_memory(
+        "worker",
+        store,
+        None,
+        [trial_candidate],
+        base_commit="abc",
+        promotion_id="job-1",
+        source_root=source,
+        curator=curator,
+    )
+    materialized = MemoryBank(
+        source, tmp_path / "result", "worker", "latest", store
+    ).prepare()
+    assert (materialized / "existing.md").read_text() == "keep-existing"
+    assert (materialized / "new.md").read_text() == "new-candidate"
+
+    second = promote_memory(
+        "worker",
+        store,
+        None,
+        [trial_candidate],
+        base_commit="abc",
+        promotion_id="job-1",
+        source_root=source,
+        curator=lambda *_: pytest.fail("idempotent promotion reran curator"),
+    )
+    assert first["output_sha256"] == second["output_sha256"]
+    assert second["status"] == "already_applied"
+
+
+def test_memory_export_failure_does_not_change_completed_task_status(tmp_path):
+    from argparse import Namespace
+    from ga_harness.runner import _persist_memories
+
+    class BrokenBank:
+        def export_delta(self, *args, **kwargs):
+            raise ValueError("invalid candidate")
+
+    args = Namespace(
+        worker_memory_source="initial",
+        supervisor_memory_source="initial",
+        promote_worker_memory=False,
+        promote_supervisor_memory=False,
+    )
+    context = {
+        "logs_dir": tmp_path / "logs",
+        "banks": {"worker": BrokenBank(), "supervisor": BrokenBank()},
+        "store": tmp_path / "store",
+    }
+    summary = _persist_memories(args, context, "abc", allow_promote=True)
+    assert summary["worker"]["error"] == "ValueError: invalid candidate"
+    assert summary["supervisor"]["error"] == "ValueError: invalid candidate"
+
+
+
+def test_supervisor_injects_only_l1_and_exposes_memory_tools(tmp_path):
+    workspace = tmp_path / "task"
+    memory = tmp_path / "memory"
+    workspace.mkdir()
+    memory.mkdir()
+    (memory / "global_mem_insight.txt").write_text("INDEX_ONLY")
+    (memory / "global_mem.txt").write_text("DEEP_L2_SECRET")
+    (memory / "supervisor_sop.md").write_text("DEEP_L3_SECRET")
+    recorder = EventRecorder(tmp_path / "logs", "model")
+    client = DecisionClient([])
+
+    ProgressiveSupervisor("task", workspace, memory, recorder, client=client)
+
+    assert "INDEX_ONLY" in client.system
+    assert "DEEP_L2_SECRET" not in client.system
+    assert "DEEP_L3_SECRET" not in client.system
+    assert {"memory_list", "memory_read"} <= {
+        tool["function"]["name"] for tool in READ_ONLY_TOOLS
+    }
+
+
+def _promotion_fixture(tmp_path):
+    source = _source_root(tmp_path)
+    bank = MemoryBank(source, tmp_path / "promotion-state", "worker", "initial")
+    root = bank.prepare()
+    (root / "learned.md").write_text("durable lesson")
+    candidate = bank.export_delta(tmp_path / "promotion-candidate", "abc")
+
+    def curator(workspace, prompt):
+        memory = workspace / "memory"
+        learned = workspace / "evidence" / "candidate-001" / "learned.md"
+        (memory / "learned.md").write_text(learned.read_text())
+        return {"done": True}
+
+    return source, candidate, curator
+
+
+def test_sensitive_candidate_files_are_rejected_without_polluting_overlay(tmp_path):
+    source = _source_root(tmp_path)
+    bank = MemoryBank(source, tmp_path / "state", "worker", "initial")
+    root = bank.prepare()
+    (root / "notes.md").write_text("API_KEY=abcdefghijklmnopqrstuvwxyz")
+    (root / ".env").write_text("TOKEN=secret")
+
+    candidate = bank.export_delta(tmp_path / "candidate", "abc")
+    manifest = json.loads((candidate / "manifest.json").read_text())
+
+    assert not (candidate / "overlay" / "notes.md").exists()
+    assert not (candidate / "overlay" / ".env").exists()
+    assert {item["path"] for item in manifest["rejected"]} == {".env", "notes.md"}
+
+
+def test_no_promote_keeps_candidate_and_does_not_change_latest(tmp_path):
+    from argparse import Namespace
+    from ga_harness.runner import _persist_memories
+
+    source = _source_root(tmp_path)
+    seed = MemoryBank(source, tmp_path / "seed", "worker", "initial")
+    seed_root = seed.prepare()
+    (seed_root / "existing.md").write_text("existing")
+    store = tmp_path / "store"
+    publish_store(seed.export_delta(tmp_path / "seed-delta", "abc"), store / "worker")
+    before = tree_digest(resolve_store(store / "worker"))
+
+    trial = MemoryBank(source, tmp_path / "trial", "worker", "initial")
+    trial_root = trial.prepare()
+    (trial_root / "new.md").write_text("candidate")
+    args = Namespace(worker_memory_source="initial", promote_worker_memory=False)
+    context = {
+        "logs_dir": tmp_path / "logs",
+        "banks": {"worker": trial},
+        "store": store,
+    }
+
+    summary = _persist_memories(args, context, "abc", allow_promote=True)
+
+    assert summary["worker"]["changed"] == 1
+    assert Path(summary["worker"]["candidate"]).is_dir()
+    assert tree_digest(resolve_store(store / "worker")) == before
+
+
+def test_curator_failure_leaves_latest_and_no_partial_publication(tmp_path):
+    from ga_harness.promotion import promote_memory
+
+    source, candidate, _ = _promotion_fixture(tmp_path)
+    store = tmp_path / "store" / "worker"
+
+    def fail(*_):
+        raise RuntimeError("curator failed")
+
+    with pytest.raises(RuntimeError, match="curator failed"):
+        promote_memory(
+            "worker",
+            store,
+            None,
+            [candidate],
+            base_commit="abc",
+            promotion_id="failed-job",
+            source_root=source,
+            curator=fail,
+        )
+
+    assert resolve_store(store) is None
+    assert not list((store / "promotions").glob("*.json"))
+    assert not list((store / "promotions" / "staged").glob("*"))
+
+
+def test_prepared_promotion_resume_does_not_rerun_curator(tmp_path, monkeypatch):
+    import ga_harness.promotion as promotion
+
+    source, candidate, curator = _promotion_fixture(tmp_path)
+    store = tmp_path / "store" / "worker"
+    real_publish = promotion.publish_store
+    calls = 0
+
+    def counted_curator(workspace, prompt):
+        nonlocal calls
+        calls += 1
+        return curator(workspace, prompt)
+
+    monkeypatch.setattr(
+        promotion,
+        "publish_store",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("crash before publish")),
+    )
+    with pytest.raises(RuntimeError, match="crash before publish"):
+        promotion.promote_memory(
+            "worker",
+            store,
+            None,
+            [candidate],
+            base_commit="abc",
+            promotion_id="prepared-job",
+            source_root=source,
+            curator=counted_curator,
+        )
+    monkeypatch.setattr(promotion, "publish_store", real_publish)
+
+    result = promotion.promote_memory(
+        "worker",
+        store,
+        None,
+        [candidate],
+        base_commit="abc",
+        promotion_id="prepared-job",
+        source_root=source,
+        curator=lambda *_: pytest.fail("prepared recovery reran curator"),
+    )
+
+    assert calls == 1
+    assert result["status"] == "recovered_prepared"
+    assert tree_digest(resolve_store(store)) == result["output_sha256"]
+
+
+def test_published_promotion_resume_matches_output_hash(tmp_path, monkeypatch):
+    import ga_harness.promotion as promotion
+
+    source, candidate, curator = _promotion_fixture(tmp_path)
+    store = tmp_path / "store" / "worker"
+    real_atomic = promotion.atomic_write_json
+
+    def crash_before_receipt(path, payload):
+        path = Path(path)
+        if path.parent.name == "promotions":
+            raise RuntimeError("crash before receipt")
+        return real_atomic(path, payload)
+
+    monkeypatch.setattr(promotion, "atomic_write_json", crash_before_receipt)
+    with pytest.raises(RuntimeError, match="crash before receipt"):
+        promotion.promote_memory(
+            "worker",
+            store,
+            None,
+            [candidate],
+            base_commit="abc",
+            promotion_id="published-job",
+            source_root=source,
+            curator=curator,
+        )
+    published_hash = tree_digest(resolve_store(store))
+    monkeypatch.setattr(promotion, "atomic_write_json", real_atomic)
+
+    result = promotion.promote_memory(
+        "worker",
+        store,
+        None,
+        [candidate],
+        base_commit="abc",
+        promotion_id="published-job",
+        source_root=source,
+        curator=lambda *_: pytest.fail("published recovery reran curator"),
+    )
+
+    assert result["status"] == "recovered_published"
+    assert result["output_sha256"] == published_hash

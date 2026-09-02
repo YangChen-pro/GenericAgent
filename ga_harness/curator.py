@@ -25,36 +25,43 @@ from ga_harness.memory import (
 Curator = Callable[[Path, str], dict[str, Any] | None]
 
 
-def _prompt(role: MemoryRole, candidate_count: int) -> str:
-    role_focus = (
+def _consolidation_prompt(role: MemoryRole, candidate_count: int) -> str:
+    focus = (
         "reusable task-solving methods and verified technical practice"
         if role == "worker"
-        else "how to improve Worker supervision, intervention, and completion judgment"
+        else "improving Worker supervision, intervention, and completion judgment"
     )
     return f"""
 You are the temporary GenericAgent Memory Curator for the {role} bank.
 Consolidate {candidate_count} completed-run candidate memories into `memory/`.
-The current latest bank is already copied into `memory/`; preserve every useful
-existing lesson. `evidence/job_snapshot/` is the frozen bank the runs started
-from. Each `evidence/candidate-NNN/` is one run's resulting bank.
+The current latest bank is already in `memory/`; preserve every useful existing
+lesson. `evidence/job_snapshot/` is the frozen start bank, and each
+`evidence/candidate-NNN/` is one run's resulting bank.
 
-Use your file tools to compare the snapshot and all candidates, then make small,
-semantic edits only under `memory/`. Merge compatible lessons instead of letting
-a later candidate overwrite an earlier one. Keep only durable, action-verified,
-task-agnostic knowledge about {role_focus}. Do not copy task names, answers,
-exact hidden checks, verifier text or numeric grading thresholds. Do not learn
-from infrastructure failures. Do not edit `memory/{L0_NAME}`.
+Compare all candidates semantically. Merge compatible lessons instead of letting
+a later file overwrite an earlier one. Keep only durable, action-verified,
+task-agnostic knowledge about {focus}. Never retain task names, answers, exact
+hidden checks, verifier text, grading criteria, numeric task constants, or
+infrastructure failures. Do not edit `memory/{L0_NAME}`.
 
-Maintain the L1-L4 contract from `{L0_NAME}`:
-- L1 `global_mem_insight.txt` is an index/high-frequency red-line layer and must
-  remain at most 30 lines.
-- L2 `global_mem.txt` stores stable cross-run facts.
-- L3 stores concise reusable SOPs.
-- L4 stores only de-identified, task-agnostic summaries.
+Maintain the L1-L4 contract from `{L0_NAME}`: L1 is an index/high-frequency
+red-line layer of at most 30 lines; L2 stores stable cross-run facts; L3 stores
+concise reusable SOPs; L4 stores only de-identified task-agnostic summaries.
+Never import knowledge from the other role. If candidates add no safe reusable
+lesson, leave `memory/` unchanged. Re-read changed files before finishing.
+""".strip()
 
-The {role} bank belongs only to {role}; never import knowledge from the other
-role. If candidates add no safe reusable lesson, leave `memory/` unchanged.
-Finish normally after re-reading the files you changed.
+
+def _run_prompt(role: MemoryRole) -> str:
+    return f"""
+You are the temporary GenericAgent Memory Curator for the {role} bank after one
+completed run. Read observable records under `evidence/run/` and maintain only
+`memory/`. Preserve useful existing lessons. Store only durable,
+action-verified, task-agnostic guidance. Never retain task identity, answers,
+exact commands, hidden checks, verifier data, grading criteria, numeric task
+constants, or infrastructure failures. Do not edit `memory/{L0_NAME}`. Keep L1
+at most 30 lines; place concise reusable detail in L3 and only de-identified
+summaries in L4. If there is no safe new lesson, leave the bank unchanged.
 """.strip()
 
 
@@ -82,9 +89,46 @@ def _run_ga_curator(workspace: Path, prompt: str, role: MemoryRole) -> dict[str,
     return result
 
 
+def _curate(
+    role: MemoryRole,
+    workspace: Path,
+    prompt: str,
+    curator: Curator | None,
+) -> dict[str, Any]:
+    return (
+        curator(workspace, prompt) or {}
+        if curator is not None
+        else _run_ga_curator(workspace, prompt, role)
+    )
+
+
 def _candidate_has_changes(path: Path) -> bool:
     payload = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
     return bool(payload.get("files") or payload.get("deleted"))
+
+
+def _layer_counts(memory: Path) -> dict[str, int]:
+    excluded = {L0_NAME, "global_mem_insight.txt", "global_mem.txt"}
+    return {
+        "l1_lines": len(
+            (memory / "global_mem_insight.txt")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ),
+        "l2_lines": len(
+            (memory / "global_mem.txt").read_text(encoding="utf-8").splitlines()
+        ),
+        "l3_files": sum(
+            path.is_file()
+            and path.name not in excluded
+            and "L4_raw_sessions" not in path.parts
+            for path in memory.rglob("*")
+        ),
+        "l4_files": sum(
+            path.is_file() and "L4_raw_sessions" in path.parts
+            for path in memory.rglob("*")
+        ),
+    }
 
 
 def distill_run_memory(
@@ -110,26 +154,12 @@ def distill_run_memory(
         for source_path in map(Path, evidence_paths):
             if source_path.is_file():
                 shutil.copy2(source_path, evidence / source_path.name)
-        prompt = f"""
-You are the temporary GenericAgent Memory Curator for the {role} bank after one
-completed run. Read the observable run records in `evidence/run/` and maintain
-only `memory/`. Preserve useful existing lessons. Store only durable,
-action-verified, task-agnostic guidance. Never retain task identity, answers,
-exact commands, hidden checks, verifier data, grading criteria, numeric task
-constants, or infrastructure failures. Do not edit `memory/{L0_NAME}`. Keep L1
-at most 30 lines; put concise reusable detail in L3 and only de-identified
-summaries in L4. If there is no safe new lesson, leave the bank unchanged.
-""".strip()
         before = tree_digest(curated)
-        result = (
-            curator(workspace, prompt) or {}
-            if curator is not None
-            else _run_ga_curator(workspace, prompt, role)
-        )
+        result = _curate(role, workspace, _run_prompt(role), curator)
         validate_memory(curated, source, role)
         replacement = memory_path.with_name(f".{memory_path.name}.{uuid.uuid4().hex}.tmp")
-        shutil.copytree(curated, replacement)
         backup = memory_path.with_name(f".{memory_path.name}.{uuid.uuid4().hex}.old")
+        shutil.copytree(curated, replacement)
         os.replace(memory_path, backup)
         try:
             os.replace(replacement, memory_path)
@@ -137,11 +167,12 @@ summaries in L4. If there is no safe new lesson, leave the bank unchanged.
             os.replace(backup, memory_path)
             raise
         shutil.rmtree(backup)
+        after = tree_digest(memory_path)
         return {
             "role": role,
             "before_sha256": before,
-            "after_sha256": tree_digest(memory_path),
-            "changed": before != tree_digest(memory_path),
+            "after_sha256": after,
+            "changed": before != after,
             "result": result,
         }
 
@@ -158,11 +189,7 @@ def consolidate_memory(
     state_dir: str | Path | None = None,
     curator: Curator | None = None,
 ) -> dict[str, Any]:
-    """Semantically merge candidate banks and export one validated store.
-
-    Inputs and output are sparse role stores. Candidates are materialized against
-    the role-specific initial bank before the Curator sees them.
-    """
+    """Semantically merge sparse candidate stores over the current latest bank."""
     source = Path(source_root or script_dir).resolve()
     candidate_paths = [Path(path).resolve() for path in candidates]
     candidate_paths = [
@@ -171,9 +198,9 @@ def consolidate_memory(
         if (path / "manifest.json").is_file() and _candidate_has_changes(path)
     ]
     output_path = Path(output).resolve()
-    temp_parent = Path(state_dir).resolve() if state_dir else output_path.parent
-    temp_parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=f"ga-{role}-curator-", dir=temp_parent) as raw:
+    parent = Path(state_dir).resolve() if state_dir else output_path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f"ga-{role}-curator-", dir=parent) as raw:
         root = Path(raw)
         workspace = root / "workspace"
         memory = materialize_bank(source, role, current_latest, workspace / "memory")
@@ -181,32 +208,33 @@ def consolidate_memory(
         materialize_bank(source, role, job_snapshot, evidence / "job_snapshot")
         for index, candidate in enumerate(candidate_paths, 1):
             materialize_bank(
-                source,
-                role,
-                candidate,
-                evidence / f"candidate-{index:03d}",
+                source, role, candidate, evidence / f"candidate-{index:03d}"
             )
         before = tree_digest(memory)
-        result: dict[str, Any] = {}
-        if candidate_paths:
-            prompt = _prompt(role, len(candidate_paths))
-            result = (
-                curator(workspace, prompt) or {}
-                if curator is not None
-                else _run_ga_curator(workspace, prompt, role)
+        result = (
+            _curate(
+                role,
+                workspace,
+                _consolidation_prompt(role, len(candidate_paths)),
+                curator,
             )
+            if candidate_paths
+            else {}
+        )
         validate_memory(memory, source, role)
         bank = MemoryBank(source, root / "export-state", role, "initial")
         bank.root = memory
         bank.export_delta(output_path, base_commit)
+        after = tree_digest(memory)
         return {
             "role": role,
             "candidate_count": len(candidate_paths),
             "before_sha256": before,
-            "after_sha256": tree_digest(memory),
+            "after_sha256": after,
             "output_sha256": tree_digest(output_path),
-            "changed": before != tree_digest(memory),
+            "changed": before != after,
             "result": result,
+            "update_counts": _layer_counts(memory),
         }
 
 
@@ -227,14 +255,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     report = consolidate_memory(
-        args.role,
-        args.current_latest,
-        args.job_snapshot,
-        args.candidate,
-        args.output,
-        base_commit=args.base_commit,
-        source_root=args.source_root,
-        state_dir=args.state_dir,
+        args.role, args.current_latest, args.job_snapshot, args.candidate, args.output,
+        base_commit=args.base_commit, source_root=args.source_root, state_dir=args.state_dir,
     )
     encoded = json.dumps(report, ensure_ascii=False, indent=2, default=str) + "\n"
     if args.report:
