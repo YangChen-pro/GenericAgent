@@ -863,3 +863,36 @@ def test_published_promotion_resume_matches_output_hash(tmp_path, monkeypatch):
 
     assert result["status"] == "recovered_published"
     assert result["output_sha256"] == published_hash
+
+
+def test_atomic_write_json_serializes_model_response_and_leaves_no_temp(tmp_path):
+    from ga_harness.events import atomic_write_json, json_safe
+
+    class Response:
+        thinking = "reasoning"
+        content = "answer"
+        tool_calls = False
+
+    target = tmp_path / "ga-summary.json"
+    atomic_write_json(target, json_safe({"result": {"data": Response()}}))
+
+    payload = json.loads(target.read_text())
+    assert payload["result"]["data"] == {
+        "thinking": "reasoning",
+        "content": "answer",
+    }
+    assert not list(tmp_path.glob(".ga-summary.json.*.tmp"))
+
+
+def test_atomic_write_json_serializes_before_creating_temp_file(tmp_path):
+    from ga_harness.events import atomic_write_json
+
+    target = tmp_path / "ga-summary.json"
+    cyclic = {}
+    cyclic["self"] = cyclic
+
+    with pytest.raises(ValueError, match="Circular reference"):
+        atomic_write_json(target, cyclic)
+
+    assert not target.exists()
+    assert not list(tmp_path.glob(".ga-summary.json.*.tmp"))

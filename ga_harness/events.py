@@ -16,15 +16,38 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def json_safe(value: Any) -> Any:
+    """Convert runtime response objects into stable JSON data."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return json_safe(model_dump())
+    structured = {
+        name: json_safe(item)
+        for name in ("thinking", "content", "tool_calls")
+        if (item := getattr(value, name, None))
+    }
+    return structured or str(value)
+
+
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    encoded = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 class EventRecorder:

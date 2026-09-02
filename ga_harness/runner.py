@@ -16,7 +16,7 @@ from ga_runtime import GenericAgent
 from ga_harness.control import HarnessControl
 from ga_harness.curator import distill_run_memory
 from ga_harness.promotion import promote_memory
-from ga_harness.events import EventRecorder, atomic_write_json, utc_now
+from ga_harness.events import EventRecorder, atomic_write_json, json_safe, utc_now
 from ga_harness.memory import MemoryBank
 from ga_harness.model import build_client, env_model_config
 from ga_harness.supervisor import ProgressiveSupervisor
@@ -43,10 +43,6 @@ def _load_env_file(path: str | Path | None) -> None:
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
         os.environ.setdefault(key, value)
-
-
-def _json_safe(value):
-    return json.loads(json.dumps(value, ensure_ascii=False, default=str))
 
 
 def _git_commit(root: Path) -> str:
@@ -268,7 +264,7 @@ def _finish_run(args, context, timing, outcome):
     memory = _persist_memories(
         args, context, base_commit, allow_promote=status == "completed"
     )
-    exit_reason = _json_safe(result.get("exit_reason"))
+    exit_reason = json_safe(result.get("exit_reason"))
     summary = {
         "schema_version": 2,
         "status": status,

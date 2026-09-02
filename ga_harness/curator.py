@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from ga_config import script_dir
+from ga_harness.events import json_safe
 from ga_harness.memory import (
     L0_NAME,
     MemoryBank,
@@ -173,7 +174,7 @@ def distill_run_memory(
             "before_sha256": before,
             "after_sha256": after,
             "changed": before != after,
-            "result": result,
+            "result": json_safe(result),
         }
 
 
@@ -233,7 +234,7 @@ def consolidate_memory(
             "after_sha256": after,
             "output_sha256": tree_digest(output_path),
             "changed": before != after,
-            "result": result,
+            "result": json_safe(result),
             "update_counts": _layer_counts(memory),
         }
 
