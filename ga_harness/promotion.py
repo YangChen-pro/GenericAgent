@@ -237,13 +237,14 @@ def promote_memory(
         promotion_id, role, job_snapshot, candidate_paths
     )
     receipt = store / "promotions" / f"{identity}.json"
+    staged = store / "promotions" / "staged" / identity
+    marker = staged.with_suffix(".json")
     existing = _existing_receipt(store, receipt)
     if existing is not None:
+        _cleanup_prepared(staged, marker)
         return existing
     if not candidate_paths:
         return {**inputs, "identity": identity, "status": "no_candidates"}
-    staged = store / "promotions" / "staged" / identity
-    marker = staged.with_suffix(".json")
     recovered = _recover_prepared(store, staged, marker, receipt, inputs, identity)
     if recovered is not None:
         return recovered

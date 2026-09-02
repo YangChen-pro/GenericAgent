@@ -48,14 +48,21 @@ def shared_l0_path(source_root: str | Path) -> Path:
     return Path(source_root).resolve() / "memory" / L0_NAME
 
 
+def _ignored_runtime_path(relative: Path) -> bool:
+    return (
+        any(part in _IGNORED_NAMES for part in relative.parts)
+        or relative.suffix.lower() in _IGNORED_SUFFIXES
+    )
+
+
+def _sensitive_path(relative: Path) -> bool:
+    return any(part.lower() in _SENSITIVE_PARTS for part in relative.parts) or any(
+        _SENSITIVE_NAME.search(part) for part in relative.parts
+    )
+
+
 def _included(relative: Path) -> bool:
-    if any(part in _IGNORED_NAMES for part in relative.parts):
-        return False
-    if any(part.lower() in _SENSITIVE_PARTS for part in relative.parts):
-        return False
-    if any(_SENSITIVE_NAME.search(part) for part in relative.parts):
-        return False
-    return relative.suffix.lower() not in _IGNORED_SUFFIXES
+    return not _ignored_runtime_path(relative) and not _sensitive_path(relative)
 
 
 def memory_files(root: str | Path) -> dict[str, Path]:
@@ -181,8 +188,10 @@ def _rejection_reason(
         return "symlink"
     if not path.is_file():
         return None
-    if not _included(relative):
-        return "sensitive_or_unsupported_path"
+    if _ignored_runtime_path(relative):
+        return "ignored_runtime_file"
+    if _sensitive_path(relative):
+        return "sensitive_path"
     unchanged_initial = (
         initial is not None and initial.is_file() and file_digest(initial) == file_digest(path)
     )
@@ -199,7 +208,7 @@ def validate_memory(root: str | Path, source_root: str | Path, role: MemoryRole)
     for path in memory.rglob("*"):
         relative = path.relative_to(memory)
         reason = _rejection_reason(relative, path, initial_files.get(relative.as_posix()))
-        if reason is not None:
+        if reason is not None and reason != "ignored_runtime_file":
             raise ValueError(
                 f"{role} memory contains a rejected file: {path.name} ({reason})"
             )
@@ -264,6 +273,8 @@ class MemoryBank:
             reason = _rejection_reason(relative_path, path, initial)
             if reason is not None:
                 rejected.append({"path": relative, "reason": reason})
+                if initial is not None:
+                    accepted.add(relative)
                 continue
             if not path.is_file():
                 continue
